@@ -5,8 +5,10 @@ import {
   buildInitialPallets,
   buildInitialPlan,
   computePlanCost,
+  computeRoundCommit,
   EARLIEST_START_MINUTES,
   MAX_DRIVING_HOURS,
+  pickCheapestFeasible,
   ratePerPallet,
   seedInitialDispatchState,
   simulateTrip,
@@ -14,7 +16,14 @@ import {
   TRUCK_CAPACITY,
   validatePlan,
 } from "./cruise";
-import type { Pallet, Plan, Trip, Truck } from "./types";
+import type {
+  OrderEvent,
+  Pallet,
+  Plan,
+  PlannerCandidate,
+  Trip,
+  Truck,
+} from "./types";
 
 describe("travel-time matrix", () => {
   it("is symmetric", () => {
@@ -370,5 +379,224 @@ describe("simulateTrip", () => {
         expect(load).toBeGreaterThanOrEqual(0);
       }
     }
+  });
+});
+
+describe("pickCheapestFeasible", () => {
+  const candidate = (
+    seed: number,
+    valid: boolean,
+    cost: number | undefined,
+    name = `p-${seed}`,
+  ): PlannerCandidate => ({
+    plannerName: name,
+    seed,
+    plan: { trips: [], unassignedPalletIds: [] },
+    valid: valid as true,
+    cost: cost as number,
+    submittedAt: 0,
+    errors: valid ? undefined : ["infeasible"],
+  });
+
+  it("returns null when no candidates", () => {
+    expect(pickCheapestFeasible([])).toBeNull();
+  });
+
+  it("returns null when all candidates are infeasible", () => {
+    const round = [
+      candidate(1, false, undefined),
+      candidate(2, false, undefined),
+      candidate(3, false, undefined),
+    ];
+    expect(pickCheapestFeasible(round)).toBeNull();
+  });
+
+  it("picks the cheapest valid candidate", () => {
+    const round = [
+      candidate(1, true, 500),
+      candidate(2, true, 300),
+      candidate(3, true, 400),
+    ];
+    const winner = pickCheapestFeasible(round);
+    expect(winner?.seed).toBe(2);
+    expect(winner?.cost).toBe(300);
+  });
+
+  it("skips candidates marked valid but missing cost", () => {
+    const round = [
+      candidate(1, true, undefined), // broken: claims valid but no cost
+      candidate(2, true, 450),
+    ];
+    const winner = pickCheapestFeasible(round);
+    expect(winner?.seed).toBe(2);
+  });
+
+  it("handles a partial grace-window round (fewer than 3 candidates)", () => {
+    // Grace-commit scenario: planner-1 valid, planner-3 still running so only
+    // two candidates in the list when the winner is picked.
+    const round = [candidate(1, true, 420), candidate(3, true, 400)];
+    const winner = pickCheapestFeasible(round);
+    expect(winner?.seed).toBe(3);
+    expect(winner?.cost).toBe(400);
+  });
+
+  it("breaks ties deterministically by seed then plannerName", () => {
+    const round = [
+      candidate(2, true, 400, "p-B"),
+      candidate(2, true, 400, "p-A"),
+      candidate(1, true, 400, "p-C"),
+    ];
+    const winner = pickCheapestFeasible(round);
+    // Same cost → lower seed wins → seed=1
+    expect(winner?.seed).toBe(1);
+    expect(winner?.plannerName).toBe("p-C");
+  });
+
+  it("ignores infeasible candidates even when they are cheaper-looking", () => {
+    const round = [
+      candidate(1, false, 100), // "cost" attached but invalid
+      candidate(2, true, 500),
+    ];
+    const winner = pickCheapestFeasible(round);
+    expect(winner?.seed).toBe(2);
+    expect(winner?.cost).toBe(500);
+  });
+});
+
+describe("computeRoundCommit", () => {
+  function makeOrder(): OrderEvent {
+    return {
+      orderId: "O-TEST-1",
+      createdAt: 0,
+      summary: "test order",
+      pallets: [
+        {
+          id: "O-TEST-1#1",
+          orderId: "O-TEST-1",
+          pickup: "LIS",
+          dropoff: "OPO",
+        },
+      ],
+    };
+  }
+
+  function makeSeededState() {
+    // Large fleet so the baseline plan is trivially feasible.
+    return seedInitialDispatchState("test-system", { fleetSize: 10 });
+  }
+
+  function invalidCandidate(plannerName: string, seed: number): PlannerCandidate {
+    return {
+      plannerName,
+      seed,
+      plan: { trips: [], unassignedPalletIds: ["O-TEST-1#1"] },
+      valid: false,
+      errors: [`${plannerName}: infeasible with fleet=2`],
+      submittedAt: 0,
+    };
+  }
+
+  it("returns 'infeasible' when every candidate is invalid (fleet=2 regression)", () => {
+    // Phase 6 regression: the demo can shrink to fleet=2 and still send a
+    // multi-pallet order. All three planners should fail and the Director
+    // should NOT replace `currentPlan` — that's how the red "Round failed"
+    // chip in DirectorChatPanel gets populated.
+    const state = makeSeededState();
+    const revalidated = [
+      invalidCandidate("trip-planner-1", 1),
+      invalidCandidate("trip-planner-2", 2),
+      invalidCandidate("trip-planner-3", 3),
+    ];
+
+    const decision = computeRoundCommit({
+      stateAfterRound: state,
+      revalidated,
+      newOrder: makeOrder(),
+      roundId: 7,
+      now: 1000,
+    });
+
+    expect(decision.kind).toBe("infeasible");
+    if (decision.kind !== "infeasible") return;
+    expect(decision.errorDetail).toContain("trip-planner-1");
+    expect(decision.errorDetail).toContain("trip-planner-3");
+    // Each planner contributed at least one error string.
+    expect(decision.errors.length).toBeGreaterThanOrEqual(3);
+  });
+
+  it("returns 'infeasible' with 'no plan' sentinel when a candidate has no error list", () => {
+    const state = makeSeededState();
+    const revalidated = [
+      {
+        plannerName: "trip-planner-1",
+        seed: 1,
+        plan: { trips: [], unassignedPalletIds: [] },
+        valid: false,
+        submittedAt: 0,
+      } satisfies PlannerCandidate,
+    ];
+
+    const decision = computeRoundCommit({
+      stateAfterRound: state,
+      revalidated,
+      newOrder: makeOrder(),
+      roundId: 1,
+      now: 0,
+    });
+
+    expect(decision.kind).toBe("infeasible");
+    if (decision.kind !== "infeasible") return;
+    expect(decision.errorDetail).toContain("no plan");
+  });
+
+  it("commits the seeded baseline plan and emits a RoundResult", () => {
+    // Using the seeded baseline plan as the "winner" — it's by construction
+    // feasible, so `tryApplyPlan` should succeed and `computeRoundCommit`
+    // should return a fully-formed RoundResult for the UI timeline.
+    const state = makeSeededState();
+    const baselinePlan = state.currentPlan;
+
+    const winner: PlannerCandidate = {
+      plannerName: "trip-planner-2",
+      seed: 42,
+      plan: baselinePlan,
+      valid: true,
+      cost: computePlanCost(baselinePlan, state.pallets),
+      submittedAt: 0,
+    };
+    const revalidated = [
+      invalidCandidate("trip-planner-1", 1),
+      winner,
+      invalidCandidate("trip-planner-3", 3),
+    ];
+
+    const decision = computeRoundCommit({
+      stateAfterRound: state,
+      revalidated,
+      newOrder: makeOrder(),
+      roundId: 12,
+      now: 9_876_543_210,
+    });
+
+    expect(decision.kind).toBe("committed");
+    if (decision.kind !== "committed") return;
+
+    expect(decision.winner.plannerName).toBe("trip-planner-2");
+    expect(decision.roundResult).toMatchObject({
+      roundId: 12,
+      orderId: "O-TEST-1",
+      winnerPlanner: "trip-planner-2",
+      winnerSeed: 42,
+      committedAt: 9_876_543_210,
+      tripCount: baselinePlan.trips.length,
+    });
+    // Cost math: priorCost and cost agree because we're "committing" the
+    // existing plan — delta is zero.
+    expect(decision.roundResult.cost).toBe(decision.roundResult.priorCost);
+    expect(decision.summary).toContain("trip-planner-2");
+    expect(decision.summary).toContain("+€0 vs prior");
+    // Applied state should still carry priors (recentRounds untouched here —
+    // the director is responsible for appending roundResult).
+    expect(decision.appliedState.recentRounds).toEqual(state.recentRounds);
   });
 });

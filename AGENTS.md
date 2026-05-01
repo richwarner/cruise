@@ -19,27 +19,36 @@ The app runs on Cloudflare Workers with Durable Objects, the Agents SDK, Workers
 
 - Keep the workshop code small, explicit, and easy to teach.
 - Use `src/shared/cruise.ts` as the single source of truth for plan feasibility and cost. Nothing else validates plans.
-- The LLM can request actions through narrow tools, but `cruise.ts` validates every proposed plan before it is persisted. "Model suggests, `cruise.ts` decides."
-- Use the Agent WebSocket connection for RPC, chat, and state broadcasts. There is no REST API for planning.
+- The LLM can request actions through narrow tools, but `cruise.ts` validates every proposed plan before it is persisted. "Model suggests, `cruise.ts` decides." The Director re-runs `validatePlan` on every planner candidate even when the planner reports `valid: true`.
+- Use the Agent WebSocket connection for RPC, chat, and state broadcasts. No REST API for planning.
 - Use Kumo via granular imports and standalone styles.
 - Prefer shared types and schemas from `src/shared` over duplicated shapes.
 - Add comments for Cloudflare Agents, Durable Objects, Workers bindings, and LLM safety boundaries. Avoid comments that restate obvious code.
-- No deterministic fallback. If the Director cannot find a feasible plan after running all three Planners, it reports the failure to chat and does not mutate `committedPlan`.
+- No deterministic fallback. If the Director cannot find a feasible plan after running all three Planners, it reports the failure to chat and does not mutate `currentPlan` or `pendingOrder`.
+- **Client opens exactly one WebSocket: to the Director.** No per-planner `useAgent` subscriptions from the browser — they cause `useAgentChat` render loops and starve the target planner's LLM call. Planner state reaches the UI via the Director's broadcast `lastRound` + a 1 Hz `getAllPlannerStates` RPC poll.
+
+## Concurrency rules (Phase 4/5 lessons)
+
+- Planner timeouts: individual planners get up to 120 s; once any planner returns valid, a `FIRST_VALID_GRACE_MS = 15_000` window caps how long we wait for cheaper alternatives.
+- Round-id guard: every `askPlannersInternal` bumps `this.currentRoundId`. Partial-round broadcasts and final commits check the id before calling `setState`; late resolutions from superseded rounds are dropped.
+- Grace-skipped planners render with `errors: ["skipped: grace window elapsed before planner returned"]`, not a fabricated timeout.
 
 ## Domain invariants
 
-- Fleet: 10 trucks, 13.5 m, 30-pallet capacity each. Tomorrow's start-of-day location per truck is persisted state.
+- Fleet: configurable size (default 10), 13.5 m, 30-pallet capacity each. `startCity` is persisted but **does not roll forward** at end of day — this prototype always plans tomorrow from the current snapshot.
 - Cities: Lisboa (LIS), Porto (OPO), Coimbra (COI), Braga (BRA), Faro (FAO).
-- Day window: trucks start earliest 06:00; every dropoff must be complete by 18:00.
-- Driving cap: total driving time per truck per day ≤ 9 hours.
+- Day window: trucks start earliest 06:00 (`startMinutes >= 360`); every dropoff must complete by 18:00 (`endMinutes <= 1080`).
+- Driving cap: total driving time per truck per day ≤ 9 h.
 - Service time: 30 minutes per pickup or dropoff stop, counted in the working day but not against the driving cap.
 - Per-leg capacity: a truck must never hold more than 30 pallets between two consecutive stops.
+- One trip per truck per day.
 - Coverage: every pallet in the order book is on exactly one trip. No deferrals.
-- End-of-day rollover: when a plan is committed, each truck's `startCity` advances to the last dropoff city of its trip.
-- Compressor/temperature tier matching is deferred to a follow-up phase. The types carry an optional `compressorType` / `tempRequirement` hook, but v1 ignores them.
+- `Trip.startMinutes` is planner-chosen (any valid time in `[360, …]` where `endMinutes <= 1080`).
+- Compressor/temperature matching is **out of scope**. It was removed from types, prompts, and validator — don't re-introduce it without an explicit plan update.
 
 ## Initial assumptions
 
-- `cruise.ts` seed data is deterministic and lives in code. A `scripts/seed.ts` can regenerate a randomized order book but is not required.
-- The Director LLM parses free-text orders like "New order: 6 pallets Porto → Faro" and calls `addOrder` then `askPlanners`.
-- Planner sub-agents are stable per system: `${systemId}-planner-1..3`.
+- `cruise.ts` seed data is deterministic: 6 orders / 12 pallets, 10 trucks across 5 cities. Lives in code; no separate seed script required.
+- The Director LLM parses free-text orders like "New order: 3 pallets Porto → Faro" and calls the **`submitOrder` tool** (preferred). `addOrder` + `askPlanners` are kept as low-level escape hatches for explicit pallet ids.
+- Planner sub-agents are stable per system: `${systemId}-planner-1..3`. All three share an identical prompt; variation comes from per-planner `sessionAffinity` passed to `createCruiseModel`.
+- Deterministic components (validator, initial plan seed) and stochastic components (LLM planners) are kept in separate modules so the LLM layer can be swapped without breaking rules logic.

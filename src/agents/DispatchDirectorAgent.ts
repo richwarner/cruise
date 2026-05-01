@@ -17,6 +17,7 @@ import {
 import {
   buildDirectorPrompt,
   computePlanCost,
+  computeRoundCommit,
   makeCandidate,
   tryApplyPlan,
   validatePlan,
@@ -38,6 +39,7 @@ import { createCruiseModel } from "./cruiseAgentCore";
 import { TripPlannerAgent } from "./TripPlannerAgent";
 
 const MAX_DIRECTOR_ACTIONS = 40;
+const MAX_RECENT_ROUNDS = 10;
 const MAX_DIRECTOR_TURN_STEPS = 6;
 const PLANNER_TIMEOUT_MS = 120_000;
 /**
@@ -161,6 +163,15 @@ export class DispatchDirectorAgent extends Think<Env, DispatchState> {
 
   private ensureDispatchState(): DispatchState {
     if (this.state.systemId === this.name) {
+      // Backfill fields added after the DO first persisted state.
+      if (!Array.isArray(this.state.recentRounds)) {
+        const patched: DispatchState = {
+          ...this.state,
+          recentRounds: [],
+        };
+        this.setState(patched);
+        return patched;
+      }
       return this.state;
     }
     const state = createInitialDispatchState(this.name);
@@ -288,22 +299,18 @@ export class DispatchDirectorAgent extends Think<Env, DispatchState> {
       this.revalidateCandidate(c, snapshot),
     );
 
-    const feasible = revalidated
-      .filter((c): c is PlannerCandidate & { cost: number } =>
-        c.valid && typeof c.cost === "number",
-      )
-      .sort((a, b) => a.cost - b.cost);
-
     const stateAfterRound = this.ensureDispatchState();
     const roundIsCurrent = this.currentRoundId === roundId;
 
-    if (feasible.length === 0) {
-      const errorDetail = revalidated
-        .map(
-          (c) =>
-            `${c.plannerName}: ${c.errors?.slice(0, 2).join("; ") ?? "no plan"}`,
-        )
-        .join(" | ");
+    const decision = computeRoundCommit({
+      stateAfterRound,
+      revalidated,
+      newOrder,
+      roundId,
+      now: Date.now(),
+    });
+
+    if (decision.kind === "infeasible") {
       if (roundIsCurrent) {
         const next: DispatchState = this.withAction(
           {
@@ -312,22 +319,18 @@ export class DispatchDirectorAgent extends Think<Env, DispatchState> {
             directorThinking: false,
           },
           "askPlanners infeasible",
-          errorDetail,
+          decision.errorDetail,
         );
         this.setState(next);
       }
       return {
         ok: false,
         candidates: revalidated,
-        errors: revalidated.flatMap((c) => c.errors ?? []),
+        errors: decision.errors,
       };
     }
 
-    const winner = feasible[0];
-    const priorCost = computePlanCost(stateAfterRound.currentPlan, stateAfterRound.pallets);
-    const applied = tryApplyPlan(stateAfterRound, winner.plan);
-
-    if (!applied.ok) {
+    if (decision.kind === "winner_rejected") {
       if (roundIsCurrent) {
         const next: DispatchState = this.withAction(
           {
@@ -336,39 +339,39 @@ export class DispatchDirectorAgent extends Think<Env, DispatchState> {
             directorThinking: false,
           },
           "askPlanners winner rejected",
-          applied.errors.slice(0, 2).join("; "),
+          decision.errors.slice(0, 2).join("; "),
         );
         this.setState(next);
       }
       return {
         ok: false,
         candidates: revalidated,
-        errors: applied.errors,
+        errors: decision.errors,
       };
     }
 
-    const delta = winner.cost - priorCost;
-    const deltaText = `${delta >= 0 ? "+" : ""}€${delta.toFixed(0)} vs prior`;
-    const summary = `${winner.plannerName} @ €${winner.cost.toFixed(0)} (${deltaText})`;
-
     if (roundIsCurrent) {
+      const priorRounds = decision.appliedState.recentRounds ?? [];
       const next: DispatchState = this.withAction(
         {
-          ...applied.state,
+          ...decision.appliedState,
           lastRound: revalidated,
+          recentRounds: [...priorRounds, decision.roundResult].slice(
+            -MAX_RECENT_ROUNDS,
+          ),
           directorThinking: false,
         },
         "askPlanners committed",
-        summary,
+        decision.summary,
       );
       this.setState(next);
     }
 
     return {
       ok: true,
-      winner: winner.plannerName,
-      winnerCost: winner.cost,
-      committedSummary: summary,
+      winner: decision.winner.plannerName,
+      winnerCost: decision.winner.cost,
+      committedSummary: decision.summary,
       candidates: revalidated,
       errors: [],
     };
@@ -549,7 +552,7 @@ export class DispatchDirectorAgent extends Think<Env, DispatchState> {
       }),
       addOrder: tool({
         description:
-          "Append an order's pallets to the order book and set it as the pending order. Each pallet must have a unique id like 'P-O-13-1' and share a pickup/dropoff city. Always follow with askPlanners to commit a new plan.",
+          "Low-level: append pre-built pallets to the order book. Prefer submitOrder which auto-generates pallet ids. Use addOrder only if the dispatcher explicitly provides pallet ids.",
         inputSchema: addOrderInputSchema,
         execute: async (input: AddOrderInput) => {
           try {
@@ -572,6 +575,42 @@ export class DispatchDirectorAgent extends Think<Env, DispatchState> {
             return {
               ok: false,
               error: error instanceof Error ? error.message : "addOrder failed",
+            };
+          }
+        },
+      }),
+      submitOrder: tool({
+        description:
+          "Preferred one-shot: add a new order AND run the planner round in a single call. The Director adds pallets (auto-generating ids like P-<orderId>-<n>), then spawns the three Planner sub-agents and commits the cheapest feasible plan. Returns the winner and cost, or the per-planner errors if all three are infeasible.",
+        inputSchema: submitOrderInputSchema,
+        execute: async (input: SubmitOrderInput) => {
+          try {
+            const parsed = submitOrderInputSchema.parse(input);
+            const order = buildOrderEventFromInput(parsed, this.ensureDispatchState());
+            await this.addOrderInternal(order);
+            const result = await this.askPlannersInternal(order.orderId);
+            if (result.ok) {
+              return {
+                ok: true,
+                data: {
+                  orderId: order.orderId,
+                  palletCount: order.pallets.length,
+                  winner: result.winner,
+                  cost: result.winnerCost,
+                  summary: result.committedSummary,
+                },
+              };
+            }
+            return {
+              ok: false,
+              errors: result.errors.slice(0, 5),
+              candidates: result.candidates.map(summarizeCandidate),
+            };
+          } catch (error) {
+            return {
+              ok: false,
+              error:
+                error instanceof Error ? error.message : "submitOrder failed",
             };
           }
         },

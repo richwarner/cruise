@@ -1,8 +1,4 @@
-import {
-  CITY_IDS,
-  type CityId,
-  type DispatchState,
-} from "../../shared/types";
+import { CITY_IDS, type CityId, type DispatchState } from "../../shared/types";
 import {
   TRAVEL_TIME_MATRIX,
   computePlanCost,
@@ -17,7 +13,7 @@ type DispatchControlRoomProps = {
 
 export function DispatchControlRoom({ dispatch }: DispatchControlRoomProps) {
   const fleetByCity = groupFleet(dispatch);
-  const revenue = computePlanCost(dispatch.currentPlan, dispatch.pallets);
+  const cost = computePlanCost(dispatch.currentPlan, dispatch.pallets);
 
   return (
     <div className="control-room">
@@ -81,8 +77,8 @@ export function DispatchControlRoom({ dispatch }: DispatchControlRoomProps) {
             </dd>
           </div>
           <div>
-            <dt>Revenue</dt>
-            <dd>€{revenue.toFixed(0)}</dd>
+            <dt>Cost</dt>
+            <dd>€{cost.toFixed(0)}</dd>
           </div>
         </dl>
       </section>

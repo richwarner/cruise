@@ -6,6 +6,7 @@ import type {
   Plan,
   PlanView,
   PlannerCandidate,
+  RoundResult,
   TripLeg,
   TripTimeline,
   Trip,
@@ -622,6 +623,7 @@ export function seedInitialDispatchState(
     pallets,
     currentPlan: plan,
     lastRound: [],
+    recentRounds: [],
     recentDirectorActions: [],
     directorThinking: false,
   };
@@ -727,18 +729,30 @@ export function buildDirectorPrompt(state: DispatchState): string {
           .map((c) => `${c.plannerName}=${c.valid ? `€${c.cost}` : "infeasible"}`)
           .join(", ")}.`;
 
-  return `You are the dispatch director. You do not produce plans yourself; you delegate to three Planner sub-agents and replace tomorrow's plan with the cheapest feasible candidate they return. There is no commit step and no day rollover — this prototype always plans tomorrow.
+  return `You are the dispatch director for a 5-city Portuguese refrigerated trucking network. You do not produce plans yourself; you delegate to three Planner sub-agents and replace tomorrow's plan with the cheapest feasible candidate they return. There is no commit step and no day rollover — this prototype always plans tomorrow.
 
-When the dispatcher describes a new order in chat (e.g. "New order: 6 pallets Porto -> Faro"):
-1. Parse the order into pallets (all with the same pickup/dropoff).
-2. Call addOrder to persist it.
-3. Call askPlanners to run the three Planner sub-agents in parallel.
-4. Report the winner and cost delta in chat. If all three candidates are infeasible, explain each failure and ask the dispatcher how to proceed. Do not invent a plan.
+Cities and their codes (use the 3-letter code in every tool call):
+  LIS = Lisbon / Lisboa
+  OPO = Porto / Oporto
+  COI = Coimbra
+  BRA = Braga
+  FAO = Faro
 
-Fleet (${state.fleetSize} trucks): ${fleetSummary}
-Pallet count: ${state.pallets.length}
-${pendingLine}
-${lastRoundLine}`;
+When the dispatcher describes a new order in chat (e.g. "New order: 3 pallets Porto -> Faro" or "2 from Lisbon to Braga"):
+1. Map the city names to codes.
+2. Generate an orderId that does not collide with existing orders (e.g. O-7, O-8, ...).
+3. Call **submitOrder** with { orderId, pickup, dropoff, pallets, summary }. This single tool adds the order AND runs the planner round.
+4. Read the tool result and reply in one or two sentences: if ok, report the winning planner, its cost, and the delta versus the prior plan. If all three planners were infeasible, list each planner's first error and ask the dispatcher how to proceed (e.g. add trucks). Do not invent a plan of your own.
+
+If the dispatcher asks an open question (e.g. "why did planner-2 fail?", "how many pallets are on TR-003?"), use inspectDispatch to read state and answer in prose.
+
+Only use addOrder + askPlanners separately if the dispatcher gives you explicit pallet ids. Otherwise always prefer submitOrder.
+
+Current state:
+  Fleet (${state.fleetSize} trucks): ${fleetSummary}
+  Pallet count: ${state.pallets.length}
+  ${pendingLine}
+  ${lastRoundLine}`;
 }
 
 // =============================================================================
@@ -812,6 +826,133 @@ function groupPalletsByOrder(pallets: Pallet[]): Array<{
     }
   }
   return Array.from(groups.values());
+}
+
+/**
+ * Given a revalidated round of candidates, return the cheapest valid one or
+ * `null` if none are feasible. Pure function so the Director commit logic +
+ * the UI winner-chip can share one source of truth (and so we can unit-test
+ * grace-commit scenarios without spinning up a DO).
+ *
+ * Ties are broken by the candidate's declared `seed` (lower first), then by
+ * `plannerName` lexicographically, so results are deterministic.
+ */
+export function pickCheapestFeasible(
+  candidates: PlannerCandidate[],
+): (PlannerCandidate & { valid: true; cost: number }) | null {
+  const valid = candidates.filter(
+    (c): c is PlannerCandidate & { valid: true; cost: number } =>
+      c.valid && typeof c.cost === "number",
+  );
+  if (valid.length === 0) return null;
+  return valid.reduce((best, c) => {
+    if (c.cost < best.cost) return c;
+    if (c.cost > best.cost) return best;
+    if (c.seed < best.seed) return c;
+    if (c.seed > best.seed) return best;
+    return c.plannerName < best.plannerName ? c : best;
+  });
+}
+
+/**
+ * Result of deciding what to do with a completed planner round.
+ *
+ *  - `infeasible`: every candidate was invalid (or the list was empty).
+ *    The Director should keep `currentPlan` unchanged, stash `revalidated`
+ *    into `lastRound`, and surface an error chip.
+ *  - `winner_rejected`: a valid winner existed but `tryApplyPlan` failed
+ *    (e.g. constraint drift between the planner's validation and the
+ *    Director's revalidation). Same "keep plan, surface error" handling.
+ *  - `committed`: the winner's plan was successfully applied. The Director
+ *    should setState to `appliedState` (already containing the winning plan)
+ *    and append `roundResult` to `recentRounds`.
+ */
+export type RoundCommitDecision =
+  | {
+      kind: "infeasible";
+      errorDetail: string;
+      errors: string[];
+    }
+  | {
+      kind: "winner_rejected";
+      winner: PlannerCandidate & { valid: true; cost: number };
+      errors: string[];
+    }
+  | {
+      kind: "committed";
+      winner: PlannerCandidate & { valid: true; cost: number };
+      appliedState: DispatchState;
+      summary: string;
+      roundResult: RoundResult;
+    };
+
+/**
+ * Pure decision function for a planner round. Extracted from
+ * `DispatchDirectorAgent.askPlannersInternal` so we can unit-test the
+ * infeasible / winner-rejected / committed branches without spinning up a
+ * Durable Object. Callers stay responsible for writing the result back to
+ * state and emitting director actions.
+ */
+export function computeRoundCommit(args: {
+  stateAfterRound: DispatchState;
+  revalidated: PlannerCandidate[];
+  newOrder: OrderEvent;
+  roundId: number;
+  now: number;
+}): RoundCommitDecision {
+  const { stateAfterRound, revalidated, newOrder, roundId, now } = args;
+  const winner = pickCheapestFeasible(revalidated);
+
+  if (winner === null) {
+    const errorDetail = revalidated
+      .map(
+        (c) =>
+          `${c.plannerName}: ${c.errors?.slice(0, 2).join("; ") ?? "no plan"}`,
+      )
+      .join(" | ");
+    return {
+      kind: "infeasible",
+      errorDetail,
+      errors: revalidated.flatMap((c) => c.errors ?? []),
+    };
+  }
+
+  const priorCost = computePlanCost(
+    stateAfterRound.currentPlan,
+    stateAfterRound.pallets,
+  );
+  const applied = tryApplyPlan(stateAfterRound, winner.plan);
+
+  if (!applied.ok) {
+    return {
+      kind: "winner_rejected",
+      winner,
+      errors: applied.errors,
+    };
+  }
+
+  const delta = winner.cost - priorCost;
+  const deltaText = `${delta >= 0 ? "+" : ""}€${delta.toFixed(0)} vs prior`;
+  const summary = `${winner.plannerName} @ €${winner.cost.toFixed(0)} (${deltaText})`;
+
+  const roundResult: RoundResult = {
+    roundId,
+    orderId: newOrder.orderId,
+    winnerPlanner: winner.plannerName,
+    winnerSeed: winner.seed,
+    cost: winner.cost,
+    priorCost,
+    committedAt: now,
+    tripCount: winner.plan.trips.length,
+  };
+
+  return {
+    kind: "committed",
+    winner,
+    appliedState: applied.state,
+    summary,
+    roundResult,
+  };
 }
 
 /** Shallow compactor for logging snapshots to the action log. */

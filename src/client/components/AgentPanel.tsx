@@ -28,6 +28,18 @@ type AgentPanelProps = {
   onResponseComplete?: () => void;
   emptyTitle?: string;
   emptyDescription?: string;
+  /**
+   * Optional quick-start buttons rendered in the empty-state area. Clicking
+   * one sends the associated text to the agent immediately — useful in
+   * demos to avoid typing boilerplate prompts.
+   */
+  suggestedPrompts?: Array<{ label: string; text: string }>;
+  /**
+   * Optional content rendered directly beneath the panel header (and above
+   * the runtime timeline). Used for ambient, read-only context such as the
+   * Director's session round-history strip.
+   */
+  afterHeader?: ReactNode;
 };
 
 export function AgentPanel({
@@ -43,6 +55,8 @@ export function AgentPanel({
   emptyTitle = "Ask about the position.",
   emptyDescription =
     "The transcript will show text, reasoning parts, and tool calls from the chess agent.",
+  suggestedPrompts,
+  afterHeader,
 }: AgentPanelProps) {
   const [message, setMessage] = useState("");
   const feedRef = useRef<HTMLDivElement>(null);
@@ -89,6 +103,8 @@ export function AgentPanel({
         </div>
       </header>
 
+      {afterHeader}
+
       {showRuntimeTimeline ? (
         <section className="runtime-timeline" aria-label="Think runtime timeline">
           <div className="runtime-timeline-header">
@@ -117,6 +133,22 @@ export function AgentPanel({
             <BrainIcon size={28} />
             <Text bold>{emptyTitle}</Text>
             <Text variant="secondary">{emptyDescription}</Text>
+            {suggestedPrompts && suggestedPrompts.length > 0 ? (
+              <div className="agent-chat-suggestions">
+                {suggestedPrompts.map((prompt) => (
+                  <button
+                    key={prompt.label}
+                    type="button"
+                    className="agent-chat-suggestion"
+                    disabled={isStreaming}
+                    onClick={() => sendMessage({ text: prompt.text })}
+                    title={prompt.text}
+                  >
+                    {prompt.label}
+                  </button>
+                ))}
+              </div>
+            ) : null}
           </div>
         ) : null}
 

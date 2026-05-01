@@ -130,15 +130,93 @@ Re-deploy command: `npm run deploy` from repo root (auth via `~/.wrangler/...`).
 ### Phase 4 notes
 
 - The Director re-runs `validatePlan` on every candidate before choosing a winner, so a buggy planner that returns `valid: true` with a stale validation can't slip past. Matches PLAN §8.5's "validation gate is always on" rule.
-- Planner timeouts are tagged as invalid candidates (`errors: ["planner X timed out after 30s"]`) so the Control Room renders a red card with a readable reason instead of hanging the round.
-- Dev-only: HMR during the mid-refactor briefly threw `getHttpUrl` inside `useAgentChat` because `useAgent` was re-initialising between saves. Fresh page loads (local + prod) render cleanly.
+- Deploy blocker discovered: the inherited `"experimental"` compatibility flag is dev-only and is rejected by the deploy API. Removed from `wrangler.jsonc` → config now just `["nodejs_compat"]`.
 
-**Pending manual tests (requires a human in the browser + Workers AI):**
+### Phase 4 stabilization (2026-05-01, post first end-to-end smoke)
 
-- From `/cruise`, click "Submit test order" with default fleet size 10 → verify three `PlannerCandidateCard`s appear in the Control Room, one gets a WINNER badge, the `currentPlan` on the map updates, and the action log records a `askPlanners committed` entry.
-- Repeat with fleet size 3 (via the fleet stepper) to force all-infeasible; verify three red cards appear, `currentPlan` stays unchanged, the status pill reverts to "Pending: O-…", and no commit is logged.
-- Open the planner-1 chat; ask "inspect your snapshot" and verify the planner's runtime timeline shows `inspectSnapshot` tool calls on the right side of the panel.
+The first live round surfaced four independent issues. All four are fixed and the new architecture is the one reflected in the current codebase (and re-deployed to `cruise.warnerrich.workers.dev`, version ID `772056c6-978f-4ce1-8b5f-4a9622626050`).
 
-## Phase 5
+1. **Cloudflare AI gateway returned `1031`** after the Workers Paid upgrade. Was an OAuth token invalidation from a long-running `wrangler tail`, not an account issue. Re-login (`npx wrangler login`) + a dev-server restart cleared it. Added `/api/ai-probe` diagnostic endpoint in `src/server/index.ts` that directly calls `env.AI.run(model, …)` and returns timing so future AI-binding regressions can be isolated from Think/agent layers in seconds.
 
-Pending human sign-off on Phase 4 manual tests before starting Phase 5 (Director chat + full chat-target toggle UX).
+2. **React "Maximum update depth exceeded" render loop** from `@ai-sdk/react`'s `useAgentChat`. Rooted in a single `useAgent` sub-subscription to a planner DO plus `useAgentChat` targeted at the same stub — the store kept firing on every Director state broadcast. **Fix:** removed all per-planner WebSocket sub-subscriptions from the client. `useDispatchSystem` now keeps exactly one connection (to the Director).
+
+3. **Planner-1 never returned when subscribed to it.** Whichever planner the client opened a WebSocket against appeared to starve its own LLM call — consistently saw planner-1 time out while planners 2 and 3 completed. Combined with (2), the cleanest fix was to drop the AgentPanel for Phase 4 and replace it with a read-only `PlannerActivityPanel` fed by 1 Hz polling of a new `DispatchDirectorAgent.getAllPlannerStates()` batch RPC. No sub-WebSockets means no starvation and no render loop; the trade-off is we don't have a chat surface in Phase 4 (Phase 5 adds it back, targeted at the Director).
+
+4. **`Promise.all` forced a 120s wait even when 2/3 planners were valid at ~15s.** Replaced with `collectPlannerCandidates` in `DispatchDirectorAgent.ts`:
+   - Fan out all three, but collect results as they resolve and broadcast partial `lastRound` state live (each resolution calls `broadcastPartialRound`).
+   - `FIRST_VALID_GRACE_MS = 15_000`: once the first valid candidate arrives, wait at most 15 s for a cheaper one, then commit.
+   - `PLANNER_TIMEOUT_MS` bumped from `30_000` → `120_000` as a hard ceiling, since Kimi K2.5 reasoning at ~4 KB prompt is regularly 30–90 s.
+   - **Round-id guard:** `DispatchDirectorAgent.currentRoundId` bumped at the start of each round. Every partial-round broadcast and every final `setState` commit checks `this.currentRoundId === roundId` before touching state. Late resolutions from abandoned rounds (e.g. a planner that finally times out at T=120 s well after the winner was grace-committed at T=30 s) are silently dropped, so they can't overwrite the UI.
+
+Order-book simplifications made in the same pass to speed up LLM reasoning:
+
+- `INITIAL_ORDERS`: 12 orders / 30 pallets → 6 orders / 12 pallets (route coverage unchanged).
+- `TEST_ORDER_PALLETS`: 4 → 2.
+- `buildPlannerPrompt` now groups pallets by order (`"Order O-1: 3 pallet(s) LIS->OPO (ids O-1-P1, O-1-P2, O-1-P3)"`) instead of one line per pallet. Prompt length dropped ~3937 → ~2979 chars.
+
+Live trace restored via batch polling (no sub-WebSockets):
+
+- New RPC `DispatchDirectorAgent.getAllPlannerStates(): Promise<PlannerState[]>` fans out to `this.subAgent(TripPlannerAgent, name).getPlannerState()` across all planners.
+- `useDispatchSystem` polls this RPC every 1000 ms **only while `directorThinking || isSubmittingOrder`**, stops on idle. One final poll on round completion so the last events are captured.
+- `PlannerActivityPanel` renders a pulsing card per planner with the most recent runtime events (timestamps + label + truncated detail) under the Trips/Cost row. Winner keeps the "WINNER" badge.
+
+Suite + build still green at 26/26 tests, typecheck, `npm run build`. Version `772056c6-978f-4ce1-8b5f-4a9622626050` is live.
+
+**Phase 4 manual verification (confirmed by user 2026-05-01):**
+
+- Submit test order → within ~30 s a valid plan commits, Operations board updates (14/14 pallets, planner-3 marked WINNER at €289 / 6 trips).
+- Grace-skipped planners render as invalid cards with `skipped: grace window elapsed before planner returned` (no longer mislabelled as 120 s timeouts).
+- Live per-planner event trace ticks in every second under each card.
+
+## Phase 5 — Director chat ✅
+
+Live at `https://cruise.warnerrich.workers.dev`, version `58a11465-012d-4f7a-b56c-7af55f1e99d9`.
+
+- [x] **`submitOrder` tool** added to `DispatchDirectorAgent.getTools()`. Wraps the existing `submitOrder` RPC: auto-generates pallet ids via `buildOrderEventFromInput`, calls `addOrderInternal` + `askPlannersInternal`, returns the winner + cost or per-planner errors. This is the preferred LLM path; `addOrder` is kept as a low-level escape hatch.
+- [x] **`buildDirectorPrompt` rewritten** (`src/shared/cruise.ts`) with:
+  - City code table with aliases (`OPO = Porto / Oporto`, `LIS = Lisbon / Lisboa`, etc.) so the LLM reliably maps free-text names to `CityId`s.
+  - Four-step workflow: parse → generate `orderId` → call `submitOrder` → report winner or ask for guidance on infeasible rounds.
+  - Prose-answer branch for open questions ("why did planner-2 fail?") using `inspectDispatch`.
+- [x] **`DirectorChatPanel`** (`src/client/components/DirectorChatPanel.tsx`) — thin wrapper around `AgentPanel` with Director-specific copy, placeholder (`"New order: 2 pallets Lisbon to Braga…"`), and runtime events wired to `dispatch.recentDirectorActions`.
+- [x] **`CruiseRoute.tsx` right-column tab toggle** — `Director Chat | Planner Activity`. Default is Chat. Both panels share the single Director WebSocket from the existing `useAgent` call; no sub-agent subscriptions opened from the client.
+- [x] CSS fix for `.runtime-timeline` (was unstyled → grew unbounded → pushed the chat composer out of the panel). Now max-height 140 px with internal scroll. `.agent-chat-feed` lost its `min-height: 200px` floor so it can shrink gracefully when the timeline is visible.
+- [x] `npm run typecheck` green. `npm test` → 26/26. `npm run build` green. Deploy green (after re-login because the long-running `wrangler tail` from earlier invalidated the OAuth token).
+
+### Phase 5 scope cut
+
+Per-planner chat target was cut from this phase. Evidence from Phase 4 showed that opening any sub-planner WebSocket starves that planner's LLM call. The Planner Activity tab (1 Hz RPC polling, no sub-subscription) already surfaces per-planner runtime events + candidate stats, so the dedicated chat target isn't essential for the demo. Revisit later with a guard (e.g. disable the planner-target tab while a round is running).
+
+**Phase 5 manual verification (pending user):**
+
+- From the Director chat: "New order: 3 pallets Porto to Faro" → verify the Director calls `submitOrder` with `pickup="OPO"`, `dropoff="FAO"`, `pallets=3`; runtime timeline shows `director tool: submitOrder` → result; final chat message reports the winning planner and cost.
+- "Why did planner-2 fail?" after a round → verify Director calls `inspectDispatch` and answers in prose without adding an order.
+- Submit test order button still works alongside chat (both paths share the `submitOrder` RPC).
+
+## Phase 6 — Director chat polish ✅
+
+Live at `https://cruise.warnerrich.workers.dev`, version `fa7ef948-194a-4a88-88d3-4b8fd4627a50`.
+
+- [x] **Winner chip in the Director chat header.** `DirectorChatPanel` now renders a `.director-round-chip` via `AgentPanel.headerAccessory`. Green `planner-N · €cost · orderId` when the latest round committed, red `Round failed` with a tooltip listing the infeasible planners otherwise. Pulled from `dispatch.lastRound` + `dispatch.pendingOrder`; no extra RPCs.
+- [x] **`pickCheapestFeasible` helper extracted** (`src/shared/cruise.ts`). Pure function shared between `DispatchDirectorAgent.askPlannersInternal` (grace-commit path) and the UI winner chip, so both stay in lockstep. Deterministic tie-break: cost → lower seed → plannerName lexicographic.
+- [x] **7 new unit tests** in `src/shared/cruise.test.ts`: empty round, all-infeasible, cheapest-valid, broken `valid=true + cost=undefined`, partial grace-window list (2 of 3 candidates), deterministic ties, and ignoring candidates flagged `valid=false` even if they have a suspiciously low cost. 33/33 tests green.
+- [x] **Suggested-prompt buttons** in the chat empty state. `AgentPanel` accepts `suggestedPrompts={ label, text }[]` and renders them as pill buttons that `sendMessage({ text })` on click (disabled while streaming). `DirectorChatPanel` seeds three demo prompts (two order submissions + "inspect current plan").
+- [x] `npm run typecheck`, `npm test` (33/33), `npm run build`, `npx wrangler deploy` all green.
+
+## Phase 7 — Round history + commit regression ✅
+
+Live at `https://cruise.warnerrich.workers.dev`, version `fc6f180f-fc43-456e-bf20-b1abfc22b33d`.
+
+- [x] **`RoundResult` type + `recentRounds` on `DispatchState`.** Capped at the last 10 rounds. Backfilled in `ensureDispatchState` for older persisted DOs so existing Director instances don't 500 after the upgrade.
+- [x] **Round-history strip in the Director chat.** New `afterHeader` slot on `AgentPanel` renders a horizontal list of `.director-round-pill` chips between the header and the runtime timeline. Each pill shows `orderId · €cost · ±€delta · planner short name`, colored green for cost down, red for up. Pills scroll horizontally when the session runs long.
+- [x] **`computeRoundCommit` pure helper** (`src/shared/cruise.ts`). Factored the branching logic out of `DispatchDirectorAgent.askPlannersInternal` into a deterministic function that returns one of `{ infeasible | winner_rejected | committed }`. Eliminates duplicated math (delta/summary/roundResult build) and makes the agent method easier to read.
+- [x] **Infeasible-round regression tests.** Three new vitest cases in `src/shared/cruise.test.ts` drive the helper directly:
+  - All-planners-infeasible → `kind: "infeasible"` with each planner name in `errorDetail` (captures the fleet=2 demo scenario).
+  - Single candidate with no error list → "no plan" sentinel flows through.
+  - Commit happy path → `RoundResult` has correct `roundId`, `committedAt`, `tripCount`, and `priorCost === cost` for a no-op commit.
+- [x] **36/36 tests green**, typecheck clean, build + deploy green.
+
+## Phase 8 backlog
+
+- **Per-planner chat target** (see Phase 5 scope cut). Requires a guard that disables the planner-target tab while a round is running so we don't re-introduce planner starvation.
+- **Round history pill click-through.** Clicking a pill could scroll the chat transcript to the corresponding "committed" message or open a detail popover with the per-planner candidates archived for that round.
+- **Cost sparkline above the pill strip.** Once we have 5+ rounds, a 60 × 12 px inline sparkline across the strip would make the "plan is improving" story pop in the demo.

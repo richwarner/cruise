@@ -3,6 +3,7 @@ import { LayerCard } from "@cloudflare/kumo/components/layer-card";
 import { GearIcon } from "@phosphor-icons/react";
 import { useCallback, useState } from "react";
 
+import { DirectorChatPanel } from "../components/DirectorChatPanel";
 import { DispatchControlRoom } from "../components/DispatchControlRoom";
 import { DispatchControls, TEST_ORDER } from "../components/DispatchControls";
 import { OperationsBoard } from "../components/OperationsBoard";
@@ -13,24 +14,30 @@ import { RouteNav } from "./RouteNav";
 const DEFAULT_SYSTEM_ID = "cruise-workshop";
 
 type PanelView = "operations" | "control-room";
+type SideView = "chat" | "activity";
 
 /**
- * Phase 4 route: end-to-end new-order flow via the Director's `submitOrder`
- * RPC, with live planner sub-subscriptions driving the Control Room cards.
- * The chat panel on the right still talks to planner-1 as a debug channel;
- * Phase 5 swaps it for the Director chat + chat-target toggle.
+ * Phase 5 route: Director chat is the primary interaction surface. The left
+ * panel toggles Operations <-> Control Room; the right panel toggles
+ * Director chat <-> Planner Activity. Chat and state sync share a single
+ * Director WebSocket via `useAgent` — no sub-agent subscriptions from the
+ * client, which is what keeps us clear of the planner-starvation and
+ * useAgentChat render-loop failure modes we hit in Phase 4.
  */
 export function CruiseRoute() {
   const [systemId, setSystemId] = useState(DEFAULT_SYSTEM_ID);
   const [panelView, setPanelView] = useState<PanelView>("operations");
+  const [sideView, setSideView] = useState<SideView>("chat");
 
   const {
+    director,
     dispatch,
     plannerStates,
     error,
     isResetting,
     isResizing,
     isSubmittingOrder,
+    refresh,
     resetDispatch,
     resizeFleet,
     submitOrder,
@@ -60,12 +67,13 @@ export function CruiseRoute() {
     <main className="app-shell cruise-shell">
       <header className="app-header">
         <div>
-          <p className="eyebrow">Phase 4 — Director with parallel planners</p>
+          <p className="eyebrow">Phase 5 — Director chat</p>
           <h1>Cruise · Dispatch Director</h1>
           <p>
-            Submit a test order to fan three Planner sub-agents out in parallel;
-            the cheapest valid plan replaces tomorrow's schedule. Shrink the
-            fleet to force infeasible rounds.
+            Describe a new order in the Director chat or click Submit test order
+            to fan three Planner sub-agents out in parallel; the cheapest valid
+            plan replaces tomorrow's schedule. Shrink the fleet to force
+            infeasible rounds.
           </p>
         </div>
         <div className="app-header-actions">
@@ -127,11 +135,25 @@ export function CruiseRoute() {
           )}
         </LayerCard>
 
-        <PlannerActivityPanel
-          dispatch={dispatch}
-          plannerStates={plannerStates}
-          isSubmittingOrder={isSubmittingOrder}
-        />
+        <div className="side-panel-column">
+          <div className="side-panel-tabs">
+            <SideTabs view={sideView} onChange={setSideView} />
+          </div>
+            {sideView === "chat" ? (
+              <DirectorChatPanel
+                agent={director}
+                dispatch={dispatch}
+                directorActions={dispatch?.recentDirectorActions ?? []}
+                onResponseComplete={refresh}
+              />
+            ) : (
+            <PlannerActivityPanel
+              dispatch={dispatch}
+              plannerStates={plannerStates}
+              isSubmittingOrder={isSubmittingOrder}
+            />
+          )}
+        </div>
       </div>
     </main>
   );
@@ -182,6 +204,39 @@ function PanelTabs({
         onClick={() => onChange("control-room")}
       >
         Control Room
+      </button>
+    </div>
+  );
+}
+
+function SideTabs({
+  view,
+  onChange,
+}: {
+  view: SideView;
+  onChange: (next: SideView) => void;
+}) {
+  return (
+    <div className="panel-tabs" role="tablist">
+      <button
+        type="button"
+        role="tab"
+        aria-selected={view === "chat"}
+        className={view === "chat" ? "panel-tab panel-tab--active" : "panel-tab"}
+        onClick={() => onChange("chat")}
+      >
+        Director Chat
+      </button>
+      <button
+        type="button"
+        role="tab"
+        aria-selected={view === "activity"}
+        className={
+          view === "activity" ? "panel-tab panel-tab--active" : "panel-tab"
+        }
+        onClick={() => onChange("activity")}
+      >
+        Planner Activity
       </button>
     </div>
   );

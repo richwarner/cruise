@@ -66,6 +66,25 @@ export type RuntimeEvent = {
   detail?: string;
 };
 
+/**
+ * One committed round of planner competition. Appended to
+ * `DispatchState.recentRounds` after `tryApplyPlan` succeeds, so the UI can
+ * show a session-long cost trend (and so operators can eyeball whether the
+ * LLM planners are actually improving the plan over time).
+ */
+export type RoundResult = {
+  roundId: number;
+  orderId: string;
+  winnerPlanner: string;
+  winnerSeed: number;
+  /** Plan cost after commit. */
+  cost: number;
+  /** Plan cost before this round committed (used for delta chips). */
+  priorCost: number;
+  committedAt: number;
+  tripCount: number;
+};
+
 export type DispatchState = {
   systemId: string;
   plannerAgentNames: string[];
@@ -76,6 +95,8 @@ export type DispatchState = {
   currentPlan: Plan;
   pendingOrder?: OrderEvent;
   lastRound: PlannerCandidate[];
+  /** Committed rounds, newest last. Capped to the last ~10 for UI + storage. */
+  recentRounds: RoundResult[];
   recentDirectorActions: DirectorAction[];
   directorThinking: boolean;
 };
