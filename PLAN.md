@@ -4,7 +4,7 @@ Prototype tool that plans tomorrow's shipments for a small refrigerated trucking
 
 Mirrors the stack and "Director Mode" structure of [deloreyj/chess-agent](https://github.com/deloreyj/chess-agent) 1:1, with chess swapped for logistics.
 
-> Scope note: per clarifying instruction, **compressor/temperature tier matching is deferred to a follow-up phase** (v1.x). The data model keeps a nullable `tempRequirement` / `compressorType` hook so it can be turned on without refactoring. All other constraints from the brief (per-leg capacity, 9h driving cap, 30-min service time per stop, 18:00 deadline, 06:00 earliest start, end-of-day position persistence) are in scope for v1.
+> Scope note: **Compressor/temperature tier matching is out of scope.** Trucks and pallets carry no temperature attributes. The plan covers tomorrow's shipments only — there is no end-of-day commit/rollover. Constraints in scope: per-leg capacity (30 pallets), 9h driving cap, 30-min service time per pickup/dropoff stop, 18:00 deadline, 06:00 earliest start, one trip per truck per day. Each truck's start time is planner-chosen (≥ 06:00).
 
 ---
 
@@ -86,7 +86,7 @@ cruise/
     │   │   ├── OperationsBoard.tsx # NEW: the "board" — cities, trucks, trips
     │   │   ├── DispatchControlRoom.tsx  # NEW: rates, fleet, action log, last round
     │   │   ├── PlannerCandidateCard.tsx # NEW: per-planner summary card
-    │   │   └── DispatchControls.tsx     # NEW: systemId input + reset
+    │   │   └── DispatchControls.tsx     # NEW: systemId input, reset, fleet size selector, "Generate sample order" button
     │   ├── hooks/
     │   │   └── useDispatchSystem.ts     # NEW: Director + 3 Planner subscriptions
     │   └── routes/
@@ -121,18 +121,16 @@ cruise/
 
 ## 3. Data model & types
 
-All shapes live in `src/shared/types.ts`; Zod mirrors in `src/shared/schemas.ts`. Compressor/temperature fields are included but left optional so v1 can ignore them; the validator only consults them when `ENABLE_COMPRESSOR_MATCH` is toggled on (see Section 4).
+All shapes live in `src/shared/types.ts`; Zod mirrors in `src/shared/schemas.ts`. No temperature/compressor attributes — out of scope for this prototype.
 
 ```ts
 export type CityId = "LIS" | "OPO" | "COI" | "BRA" | "FAO";
-export type CompressorType = "Frozen" | "Chilled" | "Ambient"; // reserved for v1.x
 
 export type Truck = {
   id: string;
   sizeMeters: 13.5;
   capacity: 30;                 // euro pallets
   startCity: CityId;            // anticipated start-of-day location
-  compressorType?: CompressorType; // v1.x; unused by validator in v1
 };
 
 export type Pallet = {
@@ -140,7 +138,6 @@ export type Pallet = {
   orderId: string;
   pickup: CityId;
   dropoff: CityId;
-  tempRequirement?: CompressorType; // v1.x
 };
 ```
 
@@ -155,6 +152,7 @@ export type TripStop = {
 export type Trip = {
   id: string;
   truckId: string;
+  startMinutes: number;         // planner-chosen start time, minutes after midnight; must be >= 360 (06:00)
   stops: TripStop[];            // first stop city must equal truck.startCity
   palletIds: string[];          // convenience: union of all stop pickups
 };
@@ -195,10 +193,11 @@ export type DirectorAction = {
 export type DispatchState = {
   systemId: string;
   plannerAgentNames: string[];  // 3 stable names
+  fleetSize: number;            // configurable from UI; default 10
   fleet: Truck[];
   pallets: Pallet[];            // full order book for tomorrow
-  committedPlan: Plan;          // current authoritative plan
-  pendingOrder?: OrderEvent;    // set between addOrder and commit
+  currentPlan: Plan;            // tomorrow's working plan; replaced (not "committed") when planners win
+  pendingOrder?: OrderEvent;    // transient: set between addOrder and askPlanners; cleared after the round
   lastRound: PlannerCandidate[]; // last 3 results, kept for UI
   recentDirectorActions: DirectorAction[];
   directorThinking: boolean;
@@ -220,10 +219,10 @@ export type TripTimeline = {
   legs: { from: CityId; to: CityId; hours: number }[];
   drivingHours: number;          // sum of leg hours
   serviceHours: number;          // 0.5 × stops.length
-  startMinutes: number;          // minutes after midnight, >= 06:00
+  startMinutes: number;          // minutes after midnight, >= 06:00 (planner-chosen, taken from trip.startMinutes)
   endMinutes: number;            // must be <= 18:00
   loadAfterStop: number[];       // pallet count after each stop, each ≤ 30
-  endCity: CityId;               // becomes next-day startCity for truckId
+  endCity: CityId;               // last dropoff city; display only (no rollover in v1)
 };
 
 export type PlanView = Plan & {
@@ -275,18 +274,17 @@ buildDirectorPrompt(state: DispatchState): string;
 Each returns an error string on failure; all errors are collected before returning so the Director can show every reason.
 
 - **Coverage**: every pallet id in `pallets` appears on exactly one trip; `plan.unassignedPalletIds` must be empty. (Brief: "All orders must be fulfilled… no 'defer to next day' option.")
-- **Truck uniqueness**: a truck appears in at most one trip per day.
+- **One trip per truck per day**: each `truckId` appears on at most one trip in `plan.trips`. (Resolved decision; previously implied, now enforced explicitly.)
 - **Origin**: `trip.stops[0].city === fleet[truckId].startCity`.
 - **Stop integrity**: for each pallet, its pickup stop precedes its dropoff stop in the trip; pickup stop city equals `pallet.pickup`; dropoff stop city equals `pallet.dropoff`.
 - **Per-leg capacity**: `simulateTrip` produces `loadAfterStop[]`; each entry must be ≤ 30. (Brief: "at no point on a trip may the truck hold more than 30 pallets simultaneously.")
 - **Driving-time cap**: `timeline.drivingHours ≤ 9`.
-- **Delivery deadline**: `timeline.startMinutes ≥ 360` (06:00) and `timeline.endMinutes ≤ 1080` (18:00). Default `startMinutes = 360`; trips start as early as possible.
-- **Service time**: `serviceHours = 0.5 × stops.length`, counted in `endMinutes` but not against the 9h driving cap.
-- **Compressor matching (v1.x, behind flag)**: if `ENABLE_COMPRESSOR_MATCH`, every pallet on a trip must share `tempRequirement`, and that value must equal the truck's `compressorType`. Off in v1 so the validator ignores temperature fields.
+- **Delivery deadline**: `trip.startMinutes` is provided by the plan; validator enforces `360 ≤ trip.startMinutes` (06:00) and `timeline.endMinutes ≤ 1080` (18:00). Each truck's start time is planner-chosen.
+- **Service time**: `serviceHours = 0.5 × stops.length`, counted in `endMinutes` but not against the 9h driving cap. No additional service time at the depot/start.
 
 ### `tryApplyPlan` behavior
 
-On success: returns a new `DispatchState` with `committedPlan = plan`, `pendingOrder = undefined`, and each truck's `startCity` updated to `timeline.endCity` **only if the committed plan was executed** — in prototype scope the fleet's `startCity` is rolled forward on commit so the "next-day position" invariant from the brief is visible in the UI. (Open question: should rollover happen on commit or on an explicit "advance day" action? See Section 11.)
+On success: returns a new `DispatchState` with `currentPlan = plan` and `pendingOrder = undefined`. **No `startCity` rollover** — this prototype plans tomorrow only and never advances the day, so each truck's `startCity` remains as seeded.
 
 ### Tests in `cruise.test.ts`
 
@@ -297,6 +295,8 @@ On success: returns a new `DispatchState` with `committedPlan = plan`, `pendingO
 - Rejects dropoff before pickup for the same pallet.
 - Rejects >9h driving.
 - Rejects arrival after 18:00.
+- Rejects a trip with `startMinutes < 360` (before 06:00).
+- Rejects a plan that places the same `truckId` on two trips (one trip per truck per day).
 - `computePlanCost` matches hand-computed sum for the seeded plan.
 
 ---
@@ -329,7 +329,7 @@ Sanity: a round trip OPO→LIS→OPO is 6.00h driving, under the 9h cap. OPO→F
 
 ### 5.3 Rate card
 
-v1: `€/pallet` depends on route only (compressor multiplier deferred). Proposed formula, encoded as a flat lookup `RATE_PER_PALLET: Record<CityId, Record<CityId, number>>`:
+`€/pallet` depends on route only. Proposed formula, encoded as a flat lookup `RATE_PER_PALLET: Record<CityId, Record<CityId, number>>`:
 
 ```txt
 ratePerPallet(from, to) = round(travelHours(from, to) * 6 + 4)
@@ -340,24 +340,24 @@ Worked examples:
 - OPO→BRA (0.75h): `round(0.75 * 6 + 4) = 9 €/pallet`
 - LIS→FAO (2.75h): `round(2.75 * 6 + 4) = 21 €/pallet` (stored as `20` or `21`, fix at seed time)
 
-v1.x (compressor on): multiply by `{ Ambient: 1.0, Chilled: 1.3, Frozen: 1.7 }`. The multiplier and temperature hooks are in the type already; only the cost function changes.
+### 5.4 Initial fleet (configurable; default 10 trucks, 2 per city)
 
-### 5.4 Initial fleet (10 trucks, 2 per city)
+Distribution balanced across cities. Default 10 trucks:
 
-Distribution balanced across cities. Compressor types are assigned now so v1.x can activate them, but v1 ignores them.
-
-- `T01` LIS, Ambient
-- `T02` LIS, Chilled
-- `T03` OPO, Ambient
-- `T04` OPO, Frozen
-- `T05` COI, Chilled
-- `T06` COI, Ambient
-- `T07` BRA, Ambient
-- `T08` BRA, Chilled
-- `T09` FAO, Frozen
-- `T10` FAO, Ambient
+- `T01` LIS
+- `T02` LIS
+- `T03` OPO
+- `T04` OPO
+- `T05` COI
+- `T06` COI
+- `T07` BRA
+- `T08` BRA
+- `T09` FAO
+- `T10` FAO
 
 All have `sizeMeters: 13.5`, `capacity: 30`.
+
+`seedInitialDispatchState(systemId, opts?: { fleetSize?: number })` parameterizes the fleet size. When `fleetSize < 10`, take the first N entries of the canonical list above (so `fleetSize: 3` yields `T01, T02, T03` — useful for forcing infeasibility demos). When `fleetSize > 10`, round-robin add extra trucks across cities (`T11` LIS, `T12` OPO, …). The UI's fleet-size selector calls `resizeFleet(n)` on the Director, which re-seeds dispatch with the new size.
 
 ### 5.5 Initial order book
 
@@ -376,11 +376,9 @@ All have `sizeMeters: 13.5`, `capacity: 30`.
 - `O-11` OPO→COI ×3
 - `O-12` COI→OPO ×2
 
-Tempreq is pre-populated but unused in v1.
-
 ### 5.6 Initial feasible plan
 
-`seedInitialDispatchState()` runs a tiny deterministic greedy (city-by-city, largest-order-first, single trip per truck, respecting capacity and the 9h cap) to produce `committedPlan`. The plan is then fed back through `validatePlan` at module init; if validation fails, the module throws so the dev notices at boot rather than at first chat turn. The `cruise.test.ts` suite asserts the seeded plan is valid and caches its cost.
+`seedInitialDispatchState()` runs a tiny deterministic greedy (city-by-city, largest-order-first, single trip per truck, respecting capacity and the 9h cap) to produce `currentPlan`. Each generated trip gets `startMinutes: 360` (06:00) by default; the planner LLM may pick later starts in subsequent rounds. The plan is then fed back through `validatePlan` at module init; if validation fails, the module throws so the dev notices at boot rather than at first chat turn. The `cruise.test.ts` suite asserts the seeded plan is valid and caches its cost.
 
 ---
 
@@ -412,19 +410,21 @@ The Director passes `this.sessionAffinity`; each Planner passes its numeric `see
 
 **@callable RPC (invoked by Director):**
 
-- `proposePlan({ seed, snapshot, newOrder }): Promise<PlannerCandidate>` — resets the planner's prior candidate, stores `snapshot` and `newOrder` on `PlannerState`, runs one Think turn with the prompt from `buildPlannerPrompt`, and returns the candidate produced by the `submitPlan` tool. If no `submitPlan` was called, returns `{ valid: false, errors: ["planner did not submit a plan"] }`.
+- `proposePlan({ seed, snapshot, newOrder }): Promise<PlannerCandidate>` — resets the planner's prior candidate, stores `snapshot` and `newOrder` on `PlannerState`, runs one Think turn (model created with `createCruiseModel(env, seed)` so `sessionAffinity` differs across the three planners) with the identical prompt from `buildPlannerPrompt(snapshot, newOrder)`, and returns the candidate produced by the `submitPlan` tool. If no `submitPlan` was called, returns `{ valid: false, errors: ["planner did not submit a plan"] }`. Caller wraps this in a 30-second timeout (Section 6.4).
 - `getPlannerState(): PlannerState` — for the UI's sub-subscription.
 
 **Tools the planner's LLM can call:**
 
-- `inspectSnapshot` — read-only; returns a compact JSON of fleet, pallets, current `committedPlan`, rates, travel matrix, and the new order.
+- `inspectSnapshot` — read-only; returns a compact JSON of fleet, pallets, `currentPlan`, rates, travel matrix, and the new order.
 - `submitPlan({ plan })` — mutating; validates via `cruise.ts.validatePlan`, stores the resulting `PlannerCandidate` on state. If invalid, returns `{ ok: false, errors }` so the LLM can retry within its `maxSteps` budget. If valid, also computes cost.
 
-**System prompt (built by `buildPlannerPrompt(snapshot, newOrder, seed)`):**
+**System prompt (built by `buildPlannerPrompt(snapshot, newOrder)`):**
+
+All three planners receive an **identical prompt**. Variation between them comes only from the per-planner `sessionAffinity` passed to `createCruiseModel(env, seed)`. The prompt does not mention the seed.
 
 - Role: "You are a fleet planner for tomorrow's refrigerated trucking schedule."
-- Rules: all pallets in the order book plus the new order must be delivered tomorrow; per-leg capacity 30; driving time ≤ 9h; all deliveries by 18:00; trips start at each truck's `startCity`.
-- Seed text: `"Planner variation seed: ${seed}. Prefer a different solution shape from your peers: e.g. seed 1 minimizes trucks used, seed 2 minimizes total km, seed 3 consolidates long-haul legs."`
+- Rules: all pallets in the order book plus the new order must be delivered tomorrow; per-leg capacity 30; driving time ≤ 9h; one trip per truck per day; each trip starts at its truck's `startCity`; `trip.startMinutes` ≥ 06:00 (360); all deliveries done by 18:00 (1080).
+- Single objective: "Minimize total cost as computed by `computePlanCost`."
 - Instructs the model to call `inspectSnapshot` at most once, then `submitPlan` exactly once with a full plan covering every pallet id.
 
 **Turn shape:** Director invokes `proposePlan` via RPC stub. The planner writes an internal `INTERNAL_TURN_MESSAGE_ID_PREFIX` message (same pattern as `SystemPlayerAgent.ts:250-258`) so the planner's chat transcript shows the request but the UI's Planner Chat panel hides it.
@@ -437,7 +437,8 @@ The Director passes `this.sessionAffinity`; each Planner passes its numeric `see
 
 - `getDispatch(): DispatchState` — simple read.
 - `resetDispatch(): DispatchState` — re-seeds, clears chat, clears planner states.
-- `submitOrder(input): DispatchState` — top-level entry point when the dispatcher uses a structured form. Internally calls `addOrder` then `askPlanners` then commits. Broadcasts state after every step.
+- `resizeFleet(size: number): DispatchState` — re-seeds dispatch with a new fleet size (Section 5.4). Clears `lastRound` and any pending order; `currentPlan` is regenerated by the greedy seeder so the UI immediately shows a feasible state.
+- `submitOrder(input): DispatchState` — top-level entry point when the dispatcher uses a structured form. Internally calls `addOrder` then `askPlanners`. Broadcasts state after every step.
 - `getPlannerState(name): PlannerState` — passthrough for UI fallback.
 
 **Tools (for the Director's own chat turns):**
@@ -458,14 +459,12 @@ const candidates = await Promise.all(
 );
 ```
 
-Then: merge candidates into `lastRound`, run `validatePlan` on each (belt-and-braces — the planner already validated), pick the lowest-cost valid candidate, call `tryApplyPlan`. On success, `setState` with the committed plan, roll forward each truck's `startCity`, log a `DirectorAction` describing the winning seed and cost delta, and write an assistant chat message. On full failure, log and write an assistant message with aggregated errors — **no fallback plan**, mirroring `AGENTS.md:31`.
-
-- `commitPlan({ plannerName })` — manual override used from Director chat: "use planner 2's plan".
+Then: merge candidates into `lastRound`, run `validatePlan` on each (belt-and-braces — the planner already validated), pick the lowest-cost valid candidate, call `tryApplyPlan`. On success, `setState` with `currentPlan` replaced (no `startCity` rollover), `pendingOrder` cleared, log a `DirectorAction` describing the winning planner and cost delta, and write an assistant chat message. On full failure, log and write an assistant message with aggregated errors — **no fallback plan**, mirroring `AGENTS.md:31`.
 
 **System prompt (built by `buildDirectorPrompt(state)`):**
 
 Text similar to `SystemDirectorAgent.ts:249-270`. Key rules:
-- "You are the dispatch director. You do not produce plans yourself; you delegate to Planner sub-agents and commit the lowest-cost feasible plan."
+- "You are the dispatch director. You do not produce plans yourself; you delegate to three Planner sub-agents and replace tomorrow's plan with the cheapest feasible candidate they return. There is no commit step and no day rollover — this prototype always plans tomorrow."
 - When the dispatcher types something like "New order: 6 pallets Porto → Faro", parse it, call `addOrder`, then `askPlanners`, then report the winner (or failure) in chat.
 - "If askPlanners reports that no plan is feasible, explain the failure and ask the dispatcher how to proceed. Do not invent a plan."
 - Include current fleet summary, pending orders, and last round's outcome in the prompt.
@@ -476,12 +475,12 @@ The spawn pattern is the one new pattern beyond chess-agent. Documented in code 
 
 - `this.subAgent(Class, name)` returns a typed RPC stub (from `agents`), same as `getPlayer()` in `SystemDirectorAgent.ts:195-197`.
 - Calling `stub.proposePlan(...)` hits the Durable Object over internal RPC; three distinct DOs (different `name`) run concurrently.
-- `Promise.all` races them. A hung planner will block the whole round; we wrap each call in a 20-second `Promise.race` timeout and tag that candidate as `{ valid: false, errors: ["timeout"] }`.
+- `Promise.all` races them. A hung planner will block the whole round; we wrap each call in a **30-second** `Promise.race` timeout and tag that candidate as `{ valid: false, errors: ["timeout"] }`.
 - Planner names are stable per system (`${systemId}-planner-1..3`) so the client's `sub: [{ agent, name }]` subscriptions remain connected across rounds and accumulate history.
 
 ### 6.5 State broadcast discipline
 
-Every `DispatchState` mutation on the Director calls `setState` so connected clients re-render. `addOrder`, `askPlanners` (twice: once with `directorThinking: true` at start, once with results at end), and `tryApplyPlan` all emit state. The Planner similarly broadcasts `plannerThinking` on entry to `proposePlan` and its `lastCandidate` on exit, which the client consumes via sub-subscriptions.
+Every `DispatchState` mutation on the Director calls `setState` so connected clients re-render. `addOrder`, `askPlanners` (twice: once with `directorThinking: true` at start, once with results at end), `tryApplyPlan`, and `resizeFleet` all emit state. The Planner similarly broadcasts `plannerThinking` on entry to `proposePlan` and its `lastCandidate` on exit, which the client consumes via sub-subscriptions.
 
 ### 6.6 Internal-turn message hiding
 
@@ -497,7 +496,7 @@ Route: `/cruise`. Component tree mirrors [SystemRoute.tsx](.chess-agent-ref/src/
 CruiseRoute
 ├── header
 │   ├── RouteNav (active="cruise")
-│   └── DispatchControls (systemId input, reset button)
+│   └── DispatchControls (systemId input, reset, fleet size selector, "Generate sample order" button)
 ├── LayerCard.board-panel
 │   ├── board-panel-header
 │   │   ├── DispatchStatus (directorThinking? planner round status?)
@@ -512,13 +511,13 @@ CruiseRoute
 
 The "chess board" analogue — the visual primary view.
 
-Subscribes to: `dispatch.fleet`, `dispatch.committedPlan`, `dispatch.pendingOrder`, `dispatch.pallets`.
+Subscribes to: `dispatch.fleet`, `dispatch.currentPlan`, `dispatch.pendingOrder`, `dispatch.pallets`.
 
 Renders:
 - `CityMap`: absolute-positioned SVG with 5 city nodes (Lisboa, Porto, Coimbra, Braga, Faro) arranged roughly as in Portugal. Nodes sized to show truck badges for trucks whose `startCity` equals that city.
-- Trip overlays: for each trip in `committedPlan`, draw an arrowed polyline through its ordered stops. Clicking a trip selects it; a side subpanel shows `TripDetail` (truck id, pallet manifest, timeline from `simulateTrip`, cost).
+- Trip overlays: for each trip in `currentPlan`, draw an arrowed polyline through its ordered stops. Clicking a trip selects it; a side subpanel shows `TripDetail` (truck id, pallet manifest, timeline from `simulateTrip`, cost, planner-chosen `startMinutes`).
 - Pending-orders pulse: if `pendingOrder` exists, the source city pulses and the order summary appears as a callout.
-- Unassigned pallets palette: shown only if `committedPlan.unassignedPalletIds` is non-empty (should always be empty in steady state; shown as a red warning strip if not).
+- Unassigned pallets palette: shown only if `currentPlan.unassignedPalletIds` is non-empty (should always be empty in steady state; shown as a red warning strip if not).
 
 Interaction is read-only; the user cannot drag pallets onto trucks. All mutations go through the chat / order submission path.
 
@@ -526,7 +525,7 @@ Interaction is read-only; the user cannot drag pallets onto trucks. All mutation
 
 Shown when panel toggled to "control-room". Kumo `LayerCard` + `Text` sections:
 
-1. **Fleet summary** — table of 10 trucks with id, startCity, compressor (greyed in v1), capacity used today (0..30).
+1. **Fleet summary** — table of `dispatch.fleetSize` trucks with id, startCity, capacity used today (0..30).
 2. **Rate card** — 5×5 table of `ratePerPallet` with diagonal struck out.
 3. **Travel-time matrix** — 5×5 hours table.
 4. **Last planner round** — three `PlannerCandidateCard`s side-by-side:
@@ -534,13 +533,23 @@ Shown when panel toggled to "control-room". Kumo `LayerCard` + `Text` sections:
    - Cost (or "infeasible" in red).
    - Trip count, trucks used, total driving hours.
    - Error list for infeasible candidates.
-   - Diff vs. previous committed plan (trips added/removed/modified — computed client-side).
+   - Diff vs. previous `currentPlan` (trips added/removed/modified — computed client-side).
 5. **Runtime Action Log** — scrollable `<ol>` of `recentDirectorActions` (same shape as `SystemRoute.tsx:215-232`), capped at 40.
-6. **Fleet start-of-day map preview** — compact list of tomorrow's projected start cities per truck (after commit-time rollover).
 
 ### 7.3 `PlannerCandidateCard`
 
-Stateless component; props: `candidate: PlannerCandidate`, `committed: Plan`, `isWinner: boolean`. Renders a `LayerCard` with badge, numeric summary, and a collapsible trip list.
+Stateless component; props: `candidate: PlannerCandidate`, `current: Plan`, `isWinner: boolean`. Renders a `LayerCard` with badge, numeric summary, and a collapsible trip list.
+
+### 7.3a `DispatchControls`
+
+Header strip with four controls:
+
+- **systemId input** — text input + "Open" button to switch dispatch sessions.
+- **Reset** — calls `resetDispatch()` on the Director.
+- **Fleet size selector** — number input (or +/- stepper) bound to `dispatch.fleetSize`. Default 10. On change, calls `resizeFleet(n)` on the Director, which re-seeds dispatch with the new fleet (Section 5.4) and broadcasts state. Useful for forcing infeasibility demos by shrinking to e.g. 3 trucks.
+- **Generate sample order** — button that picks a random pre-canned order template (e.g. `"New order O-13: 4 pallets from OPO to FAO, tomorrow."`) and inserts it into the Director chat composer (`AgentPanel`'s textarea) — does **not** auto-send, so the dispatcher can edit before pressing send. Implemented by writing into a shared composer ref / state owned by `CruiseRoute` and passed down to `AgentPanel` as a `prefillText` prop.
+
+The pre-canned templates live in `src/shared/cruise.ts` as `SAMPLE_ORDER_TEMPLATES: string[]` so the same list is reachable from tests if needed.
 
 ### 7.4 State subscription — `useDispatchSystem(systemId)`
 
@@ -563,7 +572,7 @@ const plannerAgents = [1, 2, 3].map((i) =>
 );
 ```
 
-Returns `{ director, plannerAgents, dispatch, planners, submitOrder, resetDispatch, refreshDispatch, error }`.
+Returns `{ director, plannerAgents, dispatch, planners, submitOrder, resetDispatch, resizeFleet, generateSampleOrderText, refreshDispatch, error }`. `generateSampleOrderText()` is a pure client helper that reads `SAMPLE_ORDER_TEMPLATES` from `src/shared/cruise.ts`; `resizeFleet(n)` proxies to the Director RPC.
 
 ### 7.5 Kumo imports
 
@@ -607,9 +616,9 @@ When the user types `"New order: 6 pallets Porto → Faro"` into Director Chat:
 4. `askPlanners` runs the 3 parallel planners, validates, picks the winner, commits via `tryApplyPlan`, logs actions, and returns `{ winner, committedCost, rejectedPlans }` to the model.
 5. The model writes a final assistant message ("Committed planner 2's plan at €312 (−€18 vs prior). Planner 1 was infeasible: driving time >9h on T04.").
 
-### 8.5 Planner-mode fallback
+### 8.5 Planner chats are debug-only
 
-The brief's "Planner mode" toggle (no Director, single agent, no validation gate) is not a separate Durable Object in v1. Instead it is a UI-only mode: `chatTarget = "planner-1"` talks directly to `TripPlannerAgent` and the user can call `submitPlan` conversationally. Validation still runs inside `submitPlan` (we never trust the LLM), but there is no multi-candidate selection. This matches the brief's description: "chat turns directly mutate the plan with no parallelism, no validation gate" — except we keep the validation gate on for safety; see Open Questions.
+Planner chats are debug-only. The validation gate inside `submitPlan` is **always on** in every code path: there is no way to persist an invalid plan, whether the user is chatting with the Director or directly with a planner. The brief's "Planner mode" (no validation gate) is explicitly out of scope per the resolved decisions in Section 11.
 
 ---
 
@@ -648,9 +657,9 @@ sequenceDiagram
     end
     D->>C: validatePlan(best candidate) again for safety
     D->>C: tryApplyPlan(state, P3.plan)
-    D->>D: setState (committedPlan=P3, pendingOrder=undefined, lastRound=[...], startCity rollover, action log, directorThinking:false)
+    D->>D: setState (currentPlan=P3, pendingOrder=undefined, lastRound=[...], action log, directorThinking:false)
     D-->>UI: state broadcast -> OperationsBoard re-renders
-    D-->>U: assistant message: "Committed planner 3 at €298 (-€14 vs prior). Planner 2 infeasible: T04 driving >9h."
+    D-->>U: assistant message: "Switched tomorrow's plan to planner 3 at €298 (-€14 vs prior). Planner 2 infeasible: T04 driving >9h."
 ```
 
 ### Functions and components named at each step
@@ -662,14 +671,14 @@ sequenceDiagram
 5. Each `TripPlannerAgent.proposePlan` → internal Think turn → LLM calls `inspectSnapshot` then `submitPlan`.
 6. `submitPlan.execute` → `cruise.validatePlan` → stores `PlannerCandidate` on `PlannerState` → returns to model → RPC response.
 7. Back on the Director, `askPlanners` collects 3 candidates, calls `cruise.validatePlan` again defensively, picks lowest `cost` from valid ones.
-8. `cruise.tryApplyPlan(state, winner.plan)` → returns `{ ok:true, state:next }` with updated `committedPlan` and truck `startCity` rollover.
+8. `cruise.tryApplyPlan(state, winner.plan)` → returns `{ ok:true, state:next }` with `currentPlan` replaced. No `startCity` rollover (this prototype always plans tomorrow).
 9. `this.setState(next)` broadcasts → client `onStateUpdate` fires in `useDispatchSystem` → `OperationsBoard` re-renders trip overlays → `PlannerCandidateCard`s show the three candidates with the winner badge → `Runtime Action Log` updates.
 10. Director's final assistant text is streamed through `useAgentChat` and rendered by `MessageParts` in the Director `AgentPanel`.
 
 ### Failure case
 
 If all three candidates are invalid:
-- No `tryApplyPlan` call. `committedPlan` is unchanged. `pendingOrder` remains set.
+- No `tryApplyPlan` call. `currentPlan` is unchanged. `pendingOrder` remains set.
 - `setState` still broadcasts `lastRound` (so the UI shows 3 red cards) and adds a `DirectorAction` with the aggregated errors.
 - Director writes: "No feasible plan for order O-13. Reasons: Planner 1: driving>9h on T03; Planner 2: capacity breach on T01 leg 2; Planner 3: arrival after 18:00. How do you want to proceed?"
 - Per `AGENTS.md:31`, no fallback plan is committed.
@@ -715,12 +724,12 @@ Goal: visual parity with the brief's Control Room spec, driven by the seeded sta
 
 Goal: end-to-end new-order flow works.
 
-1. Flesh out `DispatchDirectorAgent` with `addOrder`, `askPlanners` (parallel), `commitPlan`, `submitOrder` RPC, `buildDirectorPrompt`.
+1. Flesh out `DispatchDirectorAgent` with `addOrder`, `askPlanners` (parallel, 30s timeout per planner), `submitOrder` RPC, `resizeFleet` RPC, `buildDirectorPrompt`.
 2. Add 3-planner allocation (`plannerAgentNames`) to `createInitialDispatchState`.
 3. Add the action log and `lastRound` updates.
-4. Implement truck `startCity` rollover on commit.
+4. Add the **one-trip-per-truck-per-day** validator test alongside the rest of `cruise.test.ts`.
 5. Update `useDispatchSystem` with 3 sub-subscriptions; render `PlannerCandidateCard`s with live updates.
-6. Manual test: submit an order via a debug button (`DispatchControls.submitTestOrder()`); verify the three candidates appear, the winner is chosen, the board updates, the action log records the round. Test the all-infeasible path by inflating a pallet count so 9h cap is breached.
+6. Manual test: submit an order via a debug button (`DispatchControls.submitTestOrder()`); verify the three candidates appear, the winner is chosen, the board updates, the action log records the round. Test the all-infeasible path by shrinking the fleet to 3 trucks via the fleet-size selector.
 
 ### Phase 5 — Director chat + full toggle UX
 
@@ -730,40 +739,34 @@ Goal: full "Director Mode" UX from the brief.
 2. Chat target toggle with all 4 targets (`director`, `planner-1..3`); planner panels show the last `proposePlan` transcript.
 3. Failure messages in chat when all candidates are invalid.
 4. Empty-state hints, "Thinking…" indicators, error banners.
-5. Polish: Kumo styling pass; timeline preview inside `TripDetail`.
+5. **Generate Sample Order** button in `DispatchControls` that prefills the Director chat composer from `SAMPLE_ORDER_TEMPLATES`.
+6. **Fleet size selector** in `DispatchControls` wired to `resizeFleet(n)`.
+7. Polish: Kumo styling pass; timeline preview inside `TripDetail`.
 
 ### Phase 6 — Deployment checkpoint
 
 `npm run build && npm run deploy`. Smoke test the production worker URL. Record any Workers AI latency surprises.
 
-### (Deferred) Phase 7 — Compressor/temperature matching
-
-1. Flip `ENABLE_COMPRESSOR_MATCH` to `true` in `cruise.ts`.
-2. Apply compressor multiplier to `ratePerPallet`.
-3. Populate `tempRequirement` on all seeded pallets and `compressorType` on all trucks (already in seed).
-4. Add "Compressor mismatch" error to `validatePlan`.
-5. Update UI: show compressor badge on each truck card; tint trip polylines by tier.
-6. Update `buildPlannerPrompt` to mention the tier rules.
-7. Extend `cruise.test.ts` with the mismatch cases.
-
 ---
 
-## 11. Open questions
+## 11. Resolved decisions
 
-Flagged assumptions and decisions that need dispatcher/stakeholder confirmation before implementation begins.
+The original open questions were resolved by the dispatcher before implementation. Recording them here so the rationale is visible to future contributors.
 
-1. **Compressor/temperature v1.x trigger** — confirmed deferred for v1. Is v1.x a fast-follow (before any workshop demo) or genuinely optional?
-2. **End-of-day rollover timing** — the brief says "a truck ends the day wherever its last delivery is; that becomes its start location the day after." This plan rolls over on commit, so every committed plan advances tomorrow's start cities immediately. Alternative: keep `startCity` frozen until an explicit "advance day" action. Which matches the workshop story better?
-3. **Earliest trip start** — the brief says "assume an 06:00 earliest start." This plan assumes all trucks start exactly at 06:00. Is per-truck staggered start (e.g. driver shift rules) ever relevant?
-4. **Service time at start/end** — this plan counts 30 min per pickup OR dropoff stop, nothing at the starting depot. Confirm there is no additional 30 min at `stops[0]` (if the first stop is itself a pickup, one 30 min is counted).
-5. **Single trip per truck per day** — implicit from the 12-hour working day and 9h driving cap. Confirm: the validator should not reject a multi-trip plan, but the planner prompt should not encourage it. Or should the validator explicitly enforce "one trip per truck per day"?
-6. **Planner-mode validation** — the brief says Planner mode has "no validation gate." This plan keeps the validation gate on inside `submitPlan` for safety (we never trust the LLM to persist a state). Confirm that "no validation gate" means "no multi-candidate rejection loop" and not "accept any garbage plan."
-7. **Order parsing grammar** — the Director LLM is asked to parse free-text orders like "New order: 6 pallets Porto → Faro." Do we want a deterministic parser as a tool (`parseOrder`) to guard against LLM miscounts, or is this left to the model?
-8. **Planner timeout** — 20 seconds proposed. Acceptable for workshop, or should it be longer?
-9. **Seed variation strategy** — the planner prompt tells each seed a different optimization bias (min-trucks, min-km, consolidate-long-haul). Is that acceptable, or should all three get identical prompts and rely purely on model-level seed/temperature variation?
-10. **Order book regeneration** — `scripts/seed.ts` generates a randomized order book. Should the seed be configurable from the UI (reset with seed 42 vs 43), or is the deterministic baked-in seed enough?
-11. **Map accuracy** — `CityMap` uses a stylized layout of Portugal, not a real map tile. Confirm this is acceptable for the workshop (simpler, zero API keys).
-12. **Fleet size fixed at 10** — confirmed in scope. Should the UI expose a debug control to shrink the fleet to 3 for easier infeasibility demos, or is 10 trucks always shown?
+| #   | Question                         | Resolution                                                                                                                                          |
+| --- | -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | Compressor/temperature follow-up | Out of scope. No `compressorType`/`tempRequirement` in code, types, schemas, prompts, or tests. Phase 7 deleted.                                    |
+| 2   | End-of-day rollover              | No commit semantics. The prototype always plans tomorrow; `startCity` never advances. State holds `currentPlan`, not `committedPlan`.               |
+| 3   | Earliest trip start              | Per-truck variable. `Trip.startMinutes` is planner-chosen; validator enforces `>= 360` (06:00) and `endMinutes <= 1080` (18:00).                    |
+| 4   | Service time at start/end        | None at the depot. 30 minutes per pickup or dropoff stop only.                                                                                      |
+| 5   | One trip per truck per day       | Validator enforces it explicitly (Section 4).                                                                                                       |
+| 6   | Planner-mode validation          | Validation gate is always on. There is no path that persists an invalid plan, including direct planner chat (Section 8.5).                          |
+| 7   | Order entry                      | UI button "Generate sample order" prefills the Director chat composer from `SAMPLE_ORDER_TEMPLATES` (Section 7.3a). User can edit before sending.   |
+| 8   | Planner timeout                  | 30 seconds per planner (Section 6.4).                                                                                                               |
+| 9   | Seed variation strategy          | All three planners get an identical prompt that optimizes total cost. Variation comes only from per-planner `sessionAffinity` on the model.         |
+| 10  | Order-book regeneration          | Deterministic baked-in seed. No UI seed selector.                                                                                                   |
+| 11  | Map accuracy                     | Stylized SVG layout of Portugal. No real map tiles, no API keys.                                                                                    |
+| 12  | Fleet size                       | Configurable from the UI. `DispatchControls` exposes a fleet-size selector wired to `resizeFleet(n)` on the Director. Default 10.                   |
 
 ---
 

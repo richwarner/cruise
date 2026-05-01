@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.wrangler/
+.mf/
+.dev.vars
+.env
+*.local
+.chess-agent-ref/
