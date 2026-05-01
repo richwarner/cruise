@@ -99,7 +99,7 @@ export function DispatchControlRoom({ dispatch }: DispatchControlRoomProps) {
               <PlannerCandidateCard
                 key={c.plannerName}
                 candidate={c}
-                isWinner={false}
+                isWinner={isWinningCandidate(c, dispatch.lastRound)}
               />
             ))}
           </div>
@@ -169,4 +169,20 @@ function groupFleet(dispatch: DispatchState) {
     (map[t.startCity] ??= []).push(t);
   }
   return map;
+}
+
+/** Winner = cheapest valid candidate in the round. */
+function isWinningCandidate(
+  candidate: DispatchState["lastRound"][number],
+  round: DispatchState["lastRound"],
+): boolean {
+  if (!candidate.valid) return false;
+  const valid = round.filter(
+    (c) => c.valid && typeof c.cost === "number",
+  ) as Array<
+    DispatchState["lastRound"][number] & { valid: true; cost: number }
+  >;
+  if (valid.length === 0) return false;
+  const best = valid.reduce((a, b) => (a.cost <= b.cost ? a : b));
+  return best.plannerName === candidate.plannerName;
 }

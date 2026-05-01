@@ -108,6 +108,37 @@ Re-deploy command: `npm run deploy` from repo root (auth via `~/.wrangler/...`).
 - `DispatchDirectorAgent.beforeTurn/beforeToolCall/…` record director actions into the broadcast state so Phase 4 already has a live action-log feed without extra plumbing.
 - Control Room's "Last planner round" intentionally shows an empty state in Phase 3 — `dispatch.lastRound` is always `[]` until Phase 4 writes to it.
 
-## Phases 4-5
+## Phase 4 — Director with parallel planners ✅
 
-Pending human sign-off on Phase 3 manual tests (Operations/Control Room toggle, reset dispatch, fleet resize, live dev + prod) before starting Phase 4 (Director with parallel planners).
+- [x] `src/shared/schemas.ts` — added `askPlannersInputSchema` and `submitOrderInputSchema` for the new tool/RPC surface.
+- [x] `src/agents/DispatchDirectorAgent.ts` fleshed out:
+  - RPC: `submitOrder` (structured one-shot), `getPlannerState(name)` (passthrough); existing `getDispatch`/`resetDispatch`/`resizeFleet` keep working.
+  - Internals: `addOrderInternal` (de-dupe pallet ids, append to order book, set `pendingOrder`); `askPlannersInternal` (parallel spawn via `this.subAgent(TripPlannerAgent, name)`, 30 s `Promise.race` timeout per planner, defensive `validatePlan` re-run on each candidate, cheapest-cost winner, `tryApplyPlan`, broadcast state at each step).
+  - Tools for the Director's own LLM turn: `inspectDispatch`, `addOrder`, `askPlanners`. `getSystemPrompt` now delegates to `buildDirectorPrompt` so it tracks current fleet/pending/lastRound summaries.
+  - On failure: no fallback plan, no state mutation to `currentPlan`/`pendingOrder`; action log records each planner's error.
+- [x] Planner reset on dispatch reset/resize: `resetAllPlanners()` best-effort walks `plannerAgentNames` and calls `resetPlanner()` on each sub.
+- [x] `src/client/hooks/useDispatchSystem.ts` rewritten with three `TripPlannerAgent` sub-subscriptions (keyed by `plannerId`), `planners` array, `plannerStates` record, `submitOrder` wrapper, and `generateSampleOrderText` helper reading `SAMPLE_ORDER_TEMPLATES`.
+- [x] `src/client/components/DispatchControls.tsx` gained a "Submit test order" button (fixed `4 × OPO → FAO` order; orderId randomised per click so repeated rounds don't collide).
+- [x] `src/client/components/DispatchControlRoom.tsx` highlights the winning candidate (cheapest valid) in `Last planner round`.
+- [x] `src/client/routes/CruiseRoute.tsx` — wires the whole pipeline together, adds a live round-status pill in the board header ("Planners thinking…", "Director thinking…", "Pending: O-xxx"), and passes the seed-1 planner's runtime events into the debug chat.
+- [x] `cruise.test.ts` already covers the one-trip-per-truck rule added in this phase per PLAN §10.4; kept suite at 26/26.
+- [x] `npm run typecheck` green.
+- [x] `npm test` green.
+- [x] `npm run build` green.
+- [x] Deployed: `https://cruise.warnerrich.workers.dev` — version ID `ea0d4d31-1d93-4bc8-8f98-bc2a171f4818`. `/`, `/cruise`, `/api/health` all respond 200.
+
+### Phase 4 notes
+
+- The Director re-runs `validatePlan` on every candidate before choosing a winner, so a buggy planner that returns `valid: true` with a stale validation can't slip past. Matches PLAN §8.5's "validation gate is always on" rule.
+- Planner timeouts are tagged as invalid candidates (`errors: ["planner X timed out after 30s"]`) so the Control Room renders a red card with a readable reason instead of hanging the round.
+- Dev-only: HMR during the mid-refactor briefly threw `getHttpUrl` inside `useAgentChat` because `useAgent` was re-initialising between saves. Fresh page loads (local + prod) render cleanly.
+
+**Pending manual tests (requires a human in the browser + Workers AI):**
+
+- From `/cruise`, click "Submit test order" with default fleet size 10 → verify three `PlannerCandidateCard`s appear in the Control Room, one gets a WINNER badge, the `currentPlan` on the map updates, and the action log records a `askPlanners committed` entry.
+- Repeat with fleet size 3 (via the fleet stepper) to force all-infeasible; verify three red cards appear, `currentPlan` stays unchanged, the status pill reverts to "Pending: O-…", and no commit is logged.
+- Open the planner-1 chat; ask "inspect your snapshot" and verify the planner's runtime timeline shows `inspectSnapshot` tool calls on the right side of the panel.
+
+## Phase 5
+
+Pending human sign-off on Phase 4 manual tests before starting Phase 5 (Director chat + full chat-target toggle UX).

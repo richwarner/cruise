@@ -390,23 +390,17 @@ type SeedOrder = {
 };
 
 /**
- * Initial 12-order book, 30 pallets total. Includes origin cities with 3
- * outbound routes (LIS, OPO, COI) so the greedy seeder exercises its
- * multi-route consolidation path.
+ * Initial 6-order book, 12 pallets total. Kept intentionally small so the
+ * LLM planners have a short pallet list to reason and emit. Still covers
+ * all five cities so the travel-matrix and multi-dropoff paths are exercised.
  */
 const INITIAL_ORDERS: SeedOrder[] = [
-  { orderId: "O-1", pickup: "LIS", dropoff: "OPO", count: 4 },
-  { orderId: "O-2", pickup: "OPO", dropoff: "LIS", count: 3 },
-  { orderId: "O-3", pickup: "LIS", dropoff: "COI", count: 2 },
-  { orderId: "O-4", pickup: "COI", dropoff: "LIS", count: 2 },
-  { orderId: "O-5", pickup: "OPO", dropoff: "BRA", count: 3 },
-  { orderId: "O-6", pickup: "BRA", dropoff: "OPO", count: 2 },
-  { orderId: "O-7", pickup: "LIS", dropoff: "FAO", count: 3 },
-  { orderId: "O-8", pickup: "FAO", dropoff: "LIS", count: 2 },
-  { orderId: "O-9", pickup: "COI", dropoff: "BRA", count: 2 },
-  { orderId: "O-10", pickup: "BRA", dropoff: "COI", count: 2 },
-  { orderId: "O-11", pickup: "OPO", dropoff: "COI", count: 3 },
-  { orderId: "O-12", pickup: "COI", dropoff: "OPO", count: 2 },
+  { orderId: "O-1", pickup: "LIS", dropoff: "OPO", count: 3 },
+  { orderId: "O-2", pickup: "OPO", dropoff: "LIS", count: 2 },
+  { orderId: "O-3", pickup: "OPO", dropoff: "BRA", count: 2 },
+  { orderId: "O-4", pickup: "BRA", dropoff: "OPO", count: 1 },
+  { orderId: "O-5", pickup: "LIS", dropoff: "FAO", count: 2 },
+  { orderId: "O-6", pickup: "COI", dropoff: "LIS", count: 2 },
 ];
 
 export function buildInitialPallets(): Pallet[] {
@@ -638,11 +632,11 @@ export function seedInitialDispatchState(
 // =============================================================================
 
 export const SAMPLE_ORDER_TEMPLATES: string[] = [
-  "New order O-13: 4 pallets from OPO to FAO, tomorrow.",
-  "New order O-14: 3 pallets from LIS to BRA.",
-  "New order O-15: 5 pallets from FAO to OPO.",
-  "New order O-16: 2 pallets from COI to FAO.",
-  "New order O-17: 6 pallets from BRA to LIS.",
+  "New order O-7: 2 pallets from OPO to FAO, tomorrow.",
+  "New order O-8: 2 pallets from LIS to BRA.",
+  "New order O-9: 2 pallets from FAO to OPO.",
+  "New order O-10: 1 pallet from COI to FAO.",
+  "New order O-11: 3 pallets from BRA to LIS.",
 ];
 
 // =============================================================================
@@ -661,9 +655,10 @@ export function buildPlannerPrompt(
     .map((t) => `- ${t.id} @ ${t.startCity} (cap=${t.capacity})`)
     .join("\n");
 
-  const palletLines = snapshot.pallets
+  const palletLines = groupPalletsByOrder(snapshot.pallets)
     .map(
-      (p) => `- ${p.id} ${p.pickup} -> ${p.dropoff} (order ${p.orderId})`,
+      (g) =>
+        `- Order ${g.orderId}: ${g.ids.length} pallet(s) ${g.pickup}->${g.dropoff} (ids ${g.ids.join(", ")})`,
     )
     .join("\n");
 
@@ -690,7 +685,7 @@ export function buildPlannerPrompt(
   return `You are a fleet planner for tomorrow's refrigerated trucking schedule.
 
 Hard rules (your plan is rejected if any of these fail):
-- Every pallet in the order book (including the new order's pallets) must appear on exactly one trip.
+- Every pallet in the order book (including the new order's pallets) must appear on exactly one trip. Use exactly the pallet ids listed below.
 - Each truck may be used at most once per day and must start at its current startCity.
 - A truck carries at most ${TRUCK_CAPACITY} pallets at any point during its trip.
 - Total driving time per truck must be <= ${MAX_DRIVING_HOURS}h (service time is separate, 30 min per stop).
@@ -699,10 +694,12 @@ Hard rules (your plan is rejected if any of these fail):
 
 Objective: minimize the total cost as computed by the rate card (sum over pallets of the rate for their pickup->dropoff route).
 
+Strategy hint: the Current plan below is already a valid, covering schedule for every existing pallet. The cheapest way to absorb a new order is usually to keep most trips as-is and add or extend just one trip that starts at the new order's pickup city (a truck with a matching startCity). Only restructure existing trips if it strictly lowers cost.
+
 Current fleet:
 ${fleetLines}
 
-Current order book:
+Current order book (every pallet id must appear somewhere in your plan):
 ${palletLines}
 
 Current plan:
@@ -713,7 +710,7 @@ ${matrixLines}
 
 ${newOrderBlock}
 
-Use inspectSnapshot if you need the raw state again. Then call submitPlan exactly once with a complete plan covering every pallet. Remember to include startMinutes on every trip. If submitPlan rejects your plan, read the errors and try again.`;
+Call inspectSnapshot at most once if you need to double-check the raw state. Then call submitPlan with a complete plan covering every pallet id above, each trip carrying its own startMinutes. If submitPlan returns ok:false, the errors will tell you exactly what to fix — adjust and call submitPlan again (you have several retries).`;
 }
 
 export function buildDirectorPrompt(state: DispatchState): string {
@@ -785,6 +782,36 @@ export function formatMinutes(minutes: number): string {
     .toString()
     .padStart(2, "0");
   return `${h}:${m}`;
+}
+
+/**
+ * Group pallets back into their originating orders for compact prompt
+ * rendering. Preserves input pallet order so the list is deterministic.
+ */
+function groupPalletsByOrder(pallets: Pallet[]): Array<{
+  orderId: string;
+  pickup: CityId;
+  dropoff: CityId;
+  ids: string[];
+}> {
+  const groups = new Map<
+    string,
+    { orderId: string; pickup: CityId; dropoff: CityId; ids: string[] }
+  >();
+  for (const p of pallets) {
+    const existing = groups.get(p.orderId);
+    if (existing) {
+      existing.ids.push(p.id);
+    } else {
+      groups.set(p.orderId, {
+        orderId: p.orderId,
+        pickup: p.pickup,
+        dropoff: p.dropoff,
+        ids: [p.id],
+      });
+    }
+  }
+  return Array.from(groups.values());
 }
 
 /** Shallow compactor for logging snapshots to the action log. */

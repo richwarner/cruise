@@ -80,13 +80,13 @@ describe("seedInitialDispatchState", () => {
   const systemId = "test-system";
   const state = seedInitialDispatchState(systemId);
 
-  it("produces a feasible initial plan covering all 30 pallets", () => {
+  it("produces a feasible initial plan covering all 12 pallets", () => {
     const result = validatePlan(state.currentPlan, state.fleet, state.pallets);
     expect(result.ok).toBe(true);
     if (!result.ok) throw new Error(result.errors.join("\n"));
     expect(result.view.trucksUsed).toBeGreaterThan(0);
     expect(result.view.trucksUsed).toBeLessThanOrEqual(state.fleet.length);
-    expect(state.pallets).toHaveLength(30);
+    expect(state.pallets).toHaveLength(12);
   });
 
   it("assigns every pallet", () => {

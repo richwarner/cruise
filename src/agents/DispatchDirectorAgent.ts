@@ -7,30 +7,79 @@ import {
   type TurnContext,
 } from "@cloudflare/think";
 import { callable } from "agents";
-import { type ToolSet } from "ai";
+import { tool, type ToolSet } from "ai";
+import { z } from "zod";
 
 import {
   DEFAULT_FLEET_SIZE,
   createInitialDispatchState,
 } from "../shared/dispatch";
-import type { DirectorAction, DispatchState } from "../shared/types";
+import {
+  buildDirectorPrompt,
+  computePlanCost,
+  makeCandidate,
+  tryApplyPlan,
+  validatePlan,
+} from "../shared/cruise";
+import {
+  addOrderInputSchema,
+  askPlannersInputSchema,
+  submitOrderInputSchema,
+} from "../shared/schemas";
+import type {
+  DirectorAction,
+  DispatchState,
+  OrderEvent,
+  Pallet,
+  PlannerCandidate,
+  PlannerState,
+} from "../shared/types";
 import { createCruiseModel } from "./cruiseAgentCore";
+import { TripPlannerAgent } from "./TripPlannerAgent";
 
 const MAX_DIRECTOR_ACTIONS = 40;
+const MAX_DIRECTOR_TURN_STEPS = 6;
+const PLANNER_TIMEOUT_MS = 120_000;
+/**
+ * Once any planner returns a valid candidate, give the slower ones this long
+ * to also return a (potentially cheaper) valid plan before we commit. This
+ * caps how long a user waits when one planner is pathologically slow while
+ * still preserving the "cheapest valid" objective when all three are healthy.
+ */
+const FIRST_VALID_GRACE_MS = 15_000;
+
+type AddOrderInput = z.infer<typeof addOrderInputSchema>;
+type SubmitOrderInput = z.infer<typeof submitOrderInputSchema>;
+
+type AskPlannersResult = {
+  ok: boolean;
+  winner?: string;
+  winnerCost?: number;
+  committedSummary?: string;
+  candidates: PlannerCandidate[];
+  errors: string[];
+};
 
 /**
- * Phase 3 stub: the Director owns dispatch state and broadcasts it to connected
- * clients via Think's WebSocket. It does NOT yet spawn planners or expose
- * chat tools — those arrive in Phase 4 (parallel spawn) and Phase 5 (chat UX).
- *
- * The RPC surface is intentionally narrow so the Control Room UI has a stable
- * contract to render against:
- *   - getDispatch(): one-shot read
- *   - resetDispatch(): re-seed
- *   - resizeFleet(n): re-seed with a new fleet size (forces infeasibility demos)
+ * Phase 4 Director. Owns dispatch state, spawns three Planner sub-agents in
+ * parallel when a new order arrives, and replaces `currentPlan` with the
+ * cheapest feasible candidate. Exposes both RPC (client path) and tool (LLM
+ * path) entry points for `addOrder`, `askPlanners`, and `submitOrder` so a
+ * debug button and the director's own chat turn share one implementation.
  */
 export class DispatchDirectorAgent extends Think<Env, DispatchState> {
   initialState = createInitialDispatchState("default");
+  maxSteps = MAX_DIRECTOR_TURN_STEPS;
+
+  /**
+   * Generation counter bumped at the start of every planner round. Late
+   * resolutions from abandoned rounds compare against this to avoid
+   * overwriting the current round's `lastRound` (see the grace-window
+   * short-circuit in `collectPlannerCandidates`).
+   */
+  private currentRoundId = 0;
+
+  // ======== RPC (client-facing) ========
 
   @callable()
   async getDispatch(): Promise<DispatchState> {
@@ -43,6 +92,7 @@ export class DispatchDirectorAgent extends Think<Env, DispatchState> {
     const state = this.withAction(base, "Reset dispatch", `systemId=${this.name}`);
     this.setState(state);
     this.clearMessages();
+    await this.resetAllPlanners();
     return state;
   }
 
@@ -56,8 +106,58 @@ export class DispatchDirectorAgent extends Think<Env, DispatchState> {
       `${normalized} truck${normalized === 1 ? "" : "s"}`,
     );
     this.setState(state);
+    await this.resetAllPlanners();
     return state;
   }
+
+  /**
+   * Client entry point for one-shot structured order submission. Adds the
+   * order, then runs the full planner round inline — the UI sees state
+   * broadcasts at each step via Think's WebSocket.
+   */
+  @callable()
+  async submitOrder(input: SubmitOrderInput): Promise<DispatchState> {
+    const parsed = submitOrderInputSchema.parse(input);
+    const order = buildOrderEventFromInput(parsed, this.ensureDispatchState());
+    await this.addOrderInternal(order);
+    await this.askPlannersInternal(order.orderId);
+    return this.ensureDispatchState();
+  }
+
+  /** Passthrough for the UI when it needs to fetch a planner's state directly. */
+  @callable()
+  async getPlannerState(plannerName: string): Promise<PlannerState> {
+    const planner = await this.subAgent(TripPlannerAgent, plannerName);
+    return planner.getPlannerState();
+  }
+
+  /**
+   * Batch fetch of all planner states for the UI live-thinking panel. Polled
+   * from the client during active rounds instead of opening per-planner
+   * WebSockets (which cause I/O isolation errors and starve planner-1's LLM
+   * call — see the `useDispatchSystem` comment block).
+   */
+  @callable()
+  async getAllPlannerStates(): Promise<PlannerState[]> {
+    const state = this.ensureDispatchState();
+    const results = await Promise.all(
+      state.plannerAgentNames.map(async (name) => {
+        try {
+          const planner = await this.subAgent(TripPlannerAgent, name);
+          return await planner.getPlannerState();
+        } catch {
+          return {
+            plannerId: name,
+            plannerThinking: false,
+            runtimeEvents: [],
+          } satisfies PlannerState;
+        }
+      }),
+    );
+    return results;
+  }
+
+  // ======== Internal state helpers ========
 
   private ensureDispatchState(): DispatchState {
     if (this.state.systemId === this.name) {
@@ -87,25 +187,427 @@ export class DispatchDirectorAgent extends Think<Env, DispatchState> {
     };
   }
 
-  // ======== Think harness config (placeholder; Phase 5 fills in chat) ========
+  private recordDirectorAction(label: string, detail?: string) {
+    const state = this.ensureDispatchState();
+    this.setState(this.withAction(state, label, detail));
+  }
+
+  private async resetAllPlanners(): Promise<void> {
+    const state = this.ensureDispatchState();
+    await Promise.allSettled(
+      state.plannerAgentNames.map(async (name) => {
+        try {
+          const planner = await this.subAgent(TripPlannerAgent, name);
+          await planner.resetPlanner();
+        } catch {
+          // Planner might not be materialized yet — resetting is best-effort.
+        }
+      }),
+    );
+  }
+
+  // ======== Core orchestration ========
+
+  /**
+   * Append an order's pallets to the order book and set it as the pending
+   * order. No planner work happens here — callers always follow with
+   * `askPlanners` (directly, or via the LLM's next tool call).
+   */
+  private async addOrderInternal(order: OrderEvent): Promise<DispatchState> {
+    const state = this.ensureDispatchState();
+
+    const known = new Set(state.pallets.map((p) => p.id));
+    for (const pallet of order.pallets) {
+      if (known.has(pallet.id)) {
+        throw new Error(`Pallet id ${pallet.id} already exists in order book.`);
+      }
+    }
+
+    const next: DispatchState = this.withAction(
+      {
+        ...state,
+        pallets: [...state.pallets, ...order.pallets],
+        pendingOrder: order,
+      },
+      "Added order",
+      `${order.orderId} · ${order.pallets.length} pallet(s) · ${order.summary}`,
+    );
+    this.setState(next);
+    return next;
+  }
+
+  /**
+   * Spawn the three Planner sub-agents in parallel, each with a 120 s timeout.
+   * Merge candidates into `lastRound`, pick the cheapest feasible, and commit
+   * via `tryApplyPlan`. On full failure (all three infeasible, or timeout,
+   * or RPC error), leaves `currentPlan` and `pendingOrder` untouched and
+   * records the reasons in the action log — no fallback plan is invented.
+   */
+  private async askPlannersInternal(
+    orderId: string | undefined,
+  ): Promise<AskPlannersResult> {
+    const entryState = this.ensureDispatchState();
+    if (!entryState.pendingOrder) {
+      this.recordDirectorAction("askPlanners skipped", "No pending order.");
+      return {
+        ok: false,
+        candidates: [],
+        errors: ["No pending order to plan for."],
+      };
+    }
+    if (orderId && entryState.pendingOrder.orderId !== orderId) {
+      this.recordDirectorAction(
+        "askPlanners orderId mismatch",
+        `requested=${orderId} pending=${entryState.pendingOrder.orderId}`,
+      );
+    }
+
+    const snapshot = entryState;
+    const newOrder = entryState.pendingOrder;
+
+    const roundId = ++this.currentRoundId;
+    this.setState({
+      ...this.withAction(
+        entryState,
+        "askPlanners start",
+        `${snapshot.plannerAgentNames.length} planners for ${newOrder.orderId}`,
+      ),
+      directorThinking: true,
+      lastRound: [],
+    });
+
+    const candidates = await this.collectPlannerCandidates(
+      snapshot,
+      newOrder,
+      roundId,
+    );
+
+    // Defensive re-validation: trust the candidate's flag but recompute so a
+    // buggy planner can't sneak past via a stale validation result.
+    const revalidated = candidates.map((c) =>
+      this.revalidateCandidate(c, snapshot),
+    );
+
+    const feasible = revalidated
+      .filter((c): c is PlannerCandidate & { cost: number } =>
+        c.valid && typeof c.cost === "number",
+      )
+      .sort((a, b) => a.cost - b.cost);
+
+    const stateAfterRound = this.ensureDispatchState();
+    const roundIsCurrent = this.currentRoundId === roundId;
+
+    if (feasible.length === 0) {
+      const errorDetail = revalidated
+        .map(
+          (c) =>
+            `${c.plannerName}: ${c.errors?.slice(0, 2).join("; ") ?? "no plan"}`,
+        )
+        .join(" | ");
+      if (roundIsCurrent) {
+        const next: DispatchState = this.withAction(
+          {
+            ...stateAfterRound,
+            lastRound: revalidated,
+            directorThinking: false,
+          },
+          "askPlanners infeasible",
+          errorDetail,
+        );
+        this.setState(next);
+      }
+      return {
+        ok: false,
+        candidates: revalidated,
+        errors: revalidated.flatMap((c) => c.errors ?? []),
+      };
+    }
+
+    const winner = feasible[0];
+    const priorCost = computePlanCost(stateAfterRound.currentPlan, stateAfterRound.pallets);
+    const applied = tryApplyPlan(stateAfterRound, winner.plan);
+
+    if (!applied.ok) {
+      if (roundIsCurrent) {
+        const next: DispatchState = this.withAction(
+          {
+            ...stateAfterRound,
+            lastRound: revalidated,
+            directorThinking: false,
+          },
+          "askPlanners winner rejected",
+          applied.errors.slice(0, 2).join("; "),
+        );
+        this.setState(next);
+      }
+      return {
+        ok: false,
+        candidates: revalidated,
+        errors: applied.errors,
+      };
+    }
+
+    const delta = winner.cost - priorCost;
+    const deltaText = `${delta >= 0 ? "+" : ""}€${delta.toFixed(0)} vs prior`;
+    const summary = `${winner.plannerName} @ €${winner.cost.toFixed(0)} (${deltaText})`;
+
+    if (roundIsCurrent) {
+      const next: DispatchState = this.withAction(
+        {
+          ...applied.state,
+          lastRound: revalidated,
+          directorThinking: false,
+        },
+        "askPlanners committed",
+        summary,
+      );
+      this.setState(next);
+    }
+
+    return {
+      ok: true,
+      winner: winner.plannerName,
+      winnerCost: winner.cost,
+      committedSummary: summary,
+      candidates: revalidated,
+      errors: [],
+    };
+  }
+
+  /**
+   * Fan out to all planners and collect candidates as they resolve, live-
+   * broadcasting partial `lastRound` state to the UI. Short-circuits with a
+   * grace window once any planner returns valid so a single slow planner
+   * can't hold the whole round hostage (see `FIRST_VALID_GRACE_MS`).
+   */
+  private async collectPlannerCandidates(
+    snapshot: DispatchState,
+    newOrder: OrderEvent,
+    roundId: number,
+  ): Promise<PlannerCandidate[]> {
+    const plannerNames = snapshot.plannerAgentNames;
+    const resolved = new Map<string, PlannerCandidate>();
+    let firstValidAt: number | undefined;
+
+    const tasks = plannerNames.map((plannerName, index) =>
+      this.runPlannerWithTimeout(plannerName, index + 1, snapshot, newOrder)
+        .then((candidate) => {
+          // Drop late resolutions from superseded rounds so they can't
+          // overwrite a newer round's lastRound (e.g. a 120s timeout
+          // resolving long after a grace-commit).
+          if (this.currentRoundId !== roundId) return;
+          resolved.set(plannerName, candidate);
+          if (!firstValidAt && candidate.valid) firstValidAt = Date.now();
+          this.broadcastPartialRound(plannerNames, resolved, roundId);
+        }),
+    );
+
+    const allSettled = Promise.allSettled(tasks);
+
+    while (resolved.size < plannerNames.length) {
+      if (firstValidAt !== undefined) {
+        const remaining =
+          firstValidAt + FIRST_VALID_GRACE_MS - Date.now();
+        if (remaining <= 0) break;
+        await Promise.race([
+          allSettled,
+          new Promise((r) => setTimeout(r, remaining)),
+        ]);
+      } else {
+        await Promise.race([
+          allSettled,
+          new Promise((r) => setTimeout(r, 500)),
+        ]);
+      }
+    }
+
+    const missing = plannerNames.filter((n) => !resolved.has(n));
+    if (missing.length > 0) {
+      this.recordDirectorAction(
+        "askPlanners grace",
+        `committing after ${missing.length} planner(s) still running: ${missing.join(", ")}`,
+      );
+    }
+
+    return plannerNames.map((name) => {
+      const candidate = resolved.get(name);
+      if (candidate) return candidate;
+      return {
+        plannerName: name,
+        seed: plannerNames.indexOf(name) + 1,
+        plan: {
+          trips: [],
+          unassignedPalletIds: snapshot.pallets.map((p) => p.id),
+        },
+        valid: false,
+        errors: ["skipped: grace window elapsed before planner returned"],
+        submittedAt: Date.now(),
+      } satisfies PlannerCandidate;
+    });
+  }
+
+  /**
+   * Push the current partial-round state to the UI so candidate cards flip
+   * to valid/invalid as each planner returns, rather than all at once.
+   * Planners that haven't resolved yet are omitted from `lastRound`.
+   */
+  private broadcastPartialRound(
+    plannerNames: string[],
+    resolved: Map<string, PlannerCandidate>,
+    roundId: number,
+  ): void {
+    if (this.currentRoundId !== roundId) return;
+    const partial: PlannerCandidate[] = plannerNames
+      .map((name) => resolved.get(name))
+      .filter((c): c is PlannerCandidate => !!c);
+    const current = this.ensureDispatchState();
+    this.setState({ ...current, lastRound: partial });
+  }
+
+  private revalidateCandidate(
+    candidate: PlannerCandidate,
+    snapshot: DispatchState,
+  ): PlannerCandidate {
+    if (!candidate.valid) return candidate;
+    const result = validatePlan(candidate.plan, snapshot.fleet, snapshot.pallets);
+    if (!result.ok) {
+      return {
+        ...candidate,
+        valid: false,
+        errors: result.errors,
+        cost: computePlanCost(candidate.plan, snapshot.pallets),
+      } satisfies PlannerCandidate;
+    }
+    return { ...candidate, cost: result.view.totalCost };
+  }
+
+  private async runPlannerWithTimeout(
+    plannerName: string,
+    seed: number,
+    snapshot: DispatchState,
+    newOrder: OrderEvent,
+  ): Promise<PlannerCandidate> {
+    const start = Date.now();
+    try {
+      const planner = await this.subAgent(TripPlannerAgent, plannerName);
+      const result = await Promise.race<PlannerCandidate>([
+        planner.proposePlan({ seed, snapshot, newOrder }),
+        new Promise<PlannerCandidate>((_, reject) =>
+          setTimeout(
+            () => reject(new Error(`planner ${plannerName} timed out after 120s`)),
+            PLANNER_TIMEOUT_MS,
+          ),
+        ),
+      ]);
+      this.recordDirectorAction(
+        `planner ${plannerName} ${result.valid ? "valid" : "invalid"}`,
+        `seed=${seed} · ${Date.now() - start}ms${
+          result.valid ? ` · €${result.cost}` : ""
+        }`,
+      );
+      return result;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "unknown error";
+      this.recordDirectorAction(
+        `planner ${plannerName} error`,
+        `${message} · ${Date.now() - start}ms`,
+      );
+      return {
+        plannerName,
+        seed,
+        plan: {
+          trips: [],
+          unassignedPalletIds: snapshot.pallets.map((p) => p.id),
+        },
+        valid: false,
+        errors: [message],
+        submittedAt: Date.now(),
+      };
+    }
+  }
+
+  // ======== Think harness config ========
 
   getModel() {
     return createCruiseModel(this.env, this.sessionAffinity);
   }
 
   getSystemPrompt() {
-    return `You are the dispatch director for Cruise, a refrigerated trucking prototype.
-
-This is a Phase 3 placeholder. You currently have no tools and do not delegate to Planner sub-agents. Phase 4 will add addOrder/askPlanners tools; Phase 5 will teach you the dispatcher's order-entry grammar. For now, acknowledge dispatcher messages politely and note that the system is in read-only Control Room mode.`;
+    return buildDirectorPrompt(this.ensureDispatchState());
   }
 
   getTools(): ToolSet {
-    return {};
+    return {
+      inspectDispatch: tool({
+        description:
+          "Read-only: return the current dispatch state (fleet, pallets, currentPlan, pendingOrder, lastRound). Call this before addOrder if you need to check current truck/pallet counts.",
+        inputSchema: z.object({}),
+        execute: async () => ({
+          ok: true,
+          data: this.ensureDispatchState(),
+        }),
+      }),
+      addOrder: tool({
+        description:
+          "Append an order's pallets to the order book and set it as the pending order. Each pallet must have a unique id like 'P-O-13-1' and share a pickup/dropoff city. Always follow with askPlanners to commit a new plan.",
+        inputSchema: addOrderInputSchema,
+        execute: async (input: AddOrderInput) => {
+          try {
+            const parsed = addOrderInputSchema.parse(input);
+            const order: OrderEvent = {
+              orderId: parsed.orderId,
+              summary: parsed.summary,
+              pallets: parsed.pallets,
+              createdAt: Date.now(),
+            };
+            await this.addOrderInternal(order);
+            return {
+              ok: true,
+              data: {
+                orderId: order.orderId,
+                palletCount: order.pallets.length,
+              },
+            };
+          } catch (error) {
+            return {
+              ok: false,
+              error: error instanceof Error ? error.message : "addOrder failed",
+            };
+          }
+        },
+      }),
+      askPlanners: tool({
+        description:
+          "Spawn the three Planner sub-agents in parallel to propose a new plan covering the pending order. Picks the cheapest feasible candidate and replaces currentPlan. If all three are infeasible, currentPlan is left unchanged and the failure reasons are returned.",
+        inputSchema: askPlannersInputSchema,
+        execute: async ({ orderId }) => {
+          const result = await this.askPlannersInternal(orderId);
+          if (result.ok) {
+            return {
+              ok: true,
+              data: {
+                winner: result.winner,
+                cost: result.winnerCost,
+                summary: result.committedSummary,
+                candidates: result.candidates.map(summarizeCandidate),
+              },
+            };
+          }
+          return {
+            ok: false,
+            errors: result.errors.slice(0, 5),
+            candidates: result.candidates.map(summarizeCandidate),
+          };
+        },
+      }),
+    };
   }
 
-  // ======== Think lifecycle hooks — action log ========
+  // ======== Think lifecycle hooks ========
 
   beforeTurn(ctx: TurnContext) {
+    const state = this.ensureDispatchState();
+    this.setState({ ...state, directorThinking: true });
     this.recordDirectorAction(
       "director beforeTurn",
       ctx.continuation ? "continuation" : "new turn",
@@ -147,11 +649,51 @@ This is a Phase 3 placeholder. You currently have no tools and do not delegate t
     );
     return super.onChatError(error);
   }
-
-  private recordDirectorAction(label: string, detail?: string) {
-    const state = this.ensureDispatchState();
-    this.setState(this.withAction(state, label, detail));
-  }
 }
 
-export { DEFAULT_FLEET_SIZE };
+// =============================================================================
+// Helpers
+// =============================================================================
+
+function buildOrderEventFromInput(
+  input: SubmitOrderInput,
+  state: DispatchState,
+): OrderEvent {
+  const existingIds = new Set(state.pallets.map((p) => p.id));
+  const pallets: Pallet[] = [];
+  for (let i = 1; i <= input.pallets; i++) {
+    let id = `P-${input.orderId}-${i}`;
+    let suffix = 1;
+    while (existingIds.has(id)) {
+      id = `P-${input.orderId}-${i}-${suffix++}`;
+    }
+    existingIds.add(id);
+    pallets.push({
+      id,
+      orderId: input.orderId,
+      pickup: input.pickup,
+      dropoff: input.dropoff,
+    });
+  }
+  return {
+    orderId: input.orderId,
+    createdAt: Date.now(),
+    pallets,
+    summary:
+      input.summary ??
+      `${input.pallets} pallet${input.pallets === 1 ? "" : "s"} ${input.pickup} -> ${input.dropoff}`,
+  };
+}
+
+function summarizeCandidate(c: PlannerCandidate) {
+  return {
+    plannerName: c.plannerName,
+    seed: c.seed,
+    valid: c.valid,
+    cost: c.cost,
+    errors: c.errors?.slice(0, 3),
+    tripCount: c.plan.trips.length,
+  };
+}
+
+export { DEFAULT_FLEET_SIZE, makeCandidate };

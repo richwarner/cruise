@@ -247,6 +247,19 @@ code {
   overflow: hidden;
 }
 
+.planner-activity-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding-top: 12px;
+}
+
+.planner-activity-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
 .agent-chat-header {
   display: flex;
   align-items: flex-start;
@@ -935,6 +948,58 @@ code {
   box-shadow: 0 0 0 2px var(--cruise-accent);
 }
 
+.planner-card--thinking {
+  border-color: var(--cruise-accent);
+  animation: cruise-thinking-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes cruise-thinking-pulse {
+  0%, 100% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--cruise-accent) 35%, transparent);
+  }
+  50% {
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--cruise-accent) 15%, transparent);
+  }
+}
+
+.planner-card-events {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+  color: var(--cruise-muted);
+  max-height: 100px;
+  overflow-y: auto;
+}
+
+.planner-card-events li {
+  display: grid;
+  grid-template-columns: 68px 1fr;
+  gap: 6px;
+  align-items: baseline;
+}
+
+.planner-card-events time {
+  color: var(--cruise-muted);
+  font-variant-numeric: tabular-nums;
+  font-size: 10px;
+}
+
+.planner-card-events span {
+  color: var(--cruise-text);
+}
+
+.planner-card-events em {
+  grid-column: 2;
+  font-style: normal;
+  color: var(--cruise-muted);
+  font-size: 10px;
+  word-break: break-word;
+}
+
 .planner-card-header {
   display: flex;
   justify-content: space-between;
@@ -994,4 +1059,97 @@ code {
   letter-spacing: 0.08em;
   padding: 2px 6px;
   border-radius: 4px;
+}
+
+/* --- Phase 4: round status + test order button --- */
+
+.board-panel-header-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.board-panel-status {
+  font-size: 11px;
+  padding: 4px 10px;
+  border: 1px solid var(--cruise-line);
+  border-radius: 999px;
+  color: var(--cruise-muted);
+}
+
+.board-panel-status[data-active="true"] {
+  color: var(--cruise-accent);
+  border-color: var(--cruise-accent);
+  background: var(--cruise-accent-soft);
+}
+
+.dispatch-controls-test {
+  background: transparent;
+  color: var(--cruise-accent);
+  border: 1px solid var(--cruise-accent);
+  border-radius: 8px;
+  padding: 8px 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.dispatch-controls-test:hover:not(:disabled) {
+  background: var(--cruise-accent-soft);
+}
+
+.dispatch-controls-test:disabled {
+  opacity: 0.5;
+  cursor: wait;
+}
+
+/* Round failure surfacing */
+
+.operations-pending--failed {
+  border-color: var(--cruise-danger);
+  background: rgba(248, 81, 73, 0.08);
+}
+
+.operations-pending--failed strong {
+  color: var(--cruise-danger);
+}
+
+.operations-pending-reasons {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed rgba(248, 81, 73, 0.4);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+  color: var(--cruise-muted);
+}
+
+.operations-pending-reasons strong {
+  color: var(--cruise-danger);
+  font-size: 11px;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.operations-pending-button {
+  margin-top: 8px;
+  background: transparent;
+  color: var(--cruise-danger);
+  border: 1px solid var(--cruise-danger);
+  border-radius: 6px;
+  padding: 6px 10px;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.operations-pending-button:hover {
+  background: rgba(248, 81, 73, 0.12);
+}
+
+.board-panel-status[data-variant="error"] {
+  color: var(--cruise-danger);
+  border-color: var(--cruise-danger);
+  background: rgba(248, 81, 73, 0.12);
 }

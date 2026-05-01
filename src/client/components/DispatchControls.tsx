@@ -1,23 +1,39 @@
 import { useEffect, useState } from "react";
 
+import type { CityId } from "../../shared/types";
+
 type DispatchControlsProps = {
   systemId: string;
   onSystemIdChange: (next: string) => void;
   fleetSize: number;
   onResizeFleet: (size: number) => void;
   onReset: () => void;
+  onSubmitTestOrder: () => void;
   isResetting: boolean;
   isResizing: boolean;
+  isSubmittingOrder: boolean;
 };
 
+const TEST_ORDER_PICKUP: CityId = "OPO";
+const TEST_ORDER_DROPOFF: CityId = "FAO";
+const TEST_ORDER_PALLETS = 2;
+
+/**
+ * Header controls. Phase 4 adds a "Submit test order" button so the new-order
+ * round can be exercised without requiring a dispatcher chat turn. The button
+ * always submits the same canned order (OPO → FAO × 4) so the result is
+ * reproducible across runs.
+ */
 export function DispatchControls({
   systemId,
   onSystemIdChange,
   fleetSize,
   onResizeFleet,
   onReset,
+  onSubmitTestOrder,
   isResetting,
   isResizing,
+  isSubmittingOrder,
 }: DispatchControlsProps) {
   const [draftSystemId, setDraftSystemId] = useState(systemId);
 
@@ -64,6 +80,16 @@ export function DispatchControls({
 
       <button
         type="button"
+        className="dispatch-controls-test"
+        onClick={onSubmitTestOrder}
+        disabled={isSubmittingOrder}
+        title={`Submit ${TEST_ORDER_PALLETS} pallets ${TEST_ORDER_PICKUP} → ${TEST_ORDER_DROPOFF}`}
+      >
+        {isSubmittingOrder ? "Planning…" : "Submit test order"}
+      </button>
+
+      <button
+        type="button"
         className="dispatch-controls-reset"
         onClick={onReset}
         disabled={isResetting}
@@ -73,3 +99,11 @@ export function DispatchControls({
     </div>
   );
 }
+
+export const TEST_ORDER = {
+  orderId: "O-13",
+  pickup: TEST_ORDER_PICKUP,
+  dropoff: TEST_ORDER_DROPOFF,
+  pallets: TEST_ORDER_PALLETS,
+  summary: `${TEST_ORDER_PALLETS} pallets ${TEST_ORDER_PICKUP} -> ${TEST_ORDER_DROPOFF} (test)`,
+} as const;

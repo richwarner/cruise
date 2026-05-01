@@ -36,6 +36,23 @@ export const addOrderInputSchema = z.object({
   pallets: z.array(palletSchema).min(1),
 });
 
+export const askPlannersInputSchema = z.object({
+  orderId: z.string().min(1).max(40).optional(),
+});
+
+/**
+ * Structured one-shot order entry. Used by the "Submit test order" debug
+ * button and by Phase 5's director tool when the dispatcher types a natural
+ * language order and the LLM parses it.
+ */
+export const submitOrderInputSchema = z.object({
+  orderId: z.string().min(1).max(40),
+  pickup: cityIdSchema,
+  dropoff: cityIdSchema,
+  pallets: z.number().int().min(1).max(30),
+  summary: z.string().min(1).max(240).optional(),
+});
+
 export const submitPlanInputSchema = z.object({
   plan: planSchema,
   rationale: z

@@ -1,12 +1,12 @@
 import { Banner } from "@cloudflare/kumo/components/banner";
 import { LayerCard } from "@cloudflare/kumo/components/layer-card";
 import { GearIcon } from "@phosphor-icons/react";
-import { useState } from "react";
+import { useCallback, useState } from "react";
 
-import { AgentPanel } from "../components/AgentPanel";
 import { DispatchControlRoom } from "../components/DispatchControlRoom";
-import { DispatchControls } from "../components/DispatchControls";
+import { DispatchControls, TEST_ORDER } from "../components/DispatchControls";
 import { OperationsBoard } from "../components/OperationsBoard";
+import { PlannerActivityPanel } from "../components/PlannerActivityPanel";
 import { useDispatchSystem } from "../hooks/useDispatchSystem";
 import { RouteNav } from "./RouteNav";
 
@@ -15,37 +15,57 @@ const DEFAULT_SYSTEM_ID = "cruise-workshop";
 type PanelView = "operations" | "control-room";
 
 /**
- * Phase 3 route: read-only Control Room.
- *
- * Left side: map + trip inspector OR Control Room tables, driven by the
- * DispatchDirectorAgent's broadcast state. Right side: single-planner chat
- * (unchanged from Phase 2) for direct prompt debugging until Phase 5 swaps
- * in the director chat.
+ * Phase 4 route: end-to-end new-order flow via the Director's `submitOrder`
+ * RPC, with live planner sub-subscriptions driving the Control Room cards.
+ * The chat panel on the right still talks to planner-1 as a debug channel;
+ * Phase 5 swaps it for the Director chat + chat-target toggle.
  */
 export function CruiseRoute() {
   const [systemId, setSystemId] = useState(DEFAULT_SYSTEM_ID);
   const [panelView, setPanelView] = useState<PanelView>("operations");
 
   const {
-    plannerOne,
     dispatch,
+    plannerStates,
     error,
     isResetting,
     isResizing,
-    refresh,
+    isSubmittingOrder,
     resetDispatch,
     resizeFleet,
+    submitOrder,
   } = useDispatchSystem(systemId);
+
+  const runTestOrder = useCallback(() => {
+    void submitOrder({
+      ...TEST_ORDER,
+      orderId: `O-${Date.now().toString(36).slice(-5).toUpperCase()}`,
+    });
+  }, [submitOrder]);
+
+  const directorThinking = dispatch?.directorThinking ?? false;
+  const lastRound = dispatch?.lastRound ?? [];
+  const roundAllInvalid =
+    lastRound.length > 0 && lastRound.every((c) => !c.valid);
+  const roundStatus = buildRoundStatus(
+    directorThinking,
+    isSubmittingOrder,
+    dispatch?.pendingOrder?.orderId,
+    roundAllInvalid,
+  );
+  const roundStatusIsError =
+    !!dispatch?.pendingOrder && roundAllInvalid && !isSubmittingOrder;
 
   return (
     <main className="app-shell cruise-shell">
       <header className="app-header">
         <div>
-          <p className="eyebrow">Phase 3 — Control Room (read-only)</p>
+          <p className="eyebrow">Phase 4 — Director with parallel planners</p>
           <h1>Cruise · Dispatch Director</h1>
           <p>
-            Seeded dispatch state from the Director DO. Toggle the panel for
-            the Operations map or the Control Room tables.
+            Submit a test order to fan three Planner sub-agents out in parallel;
+            the cheapest valid plan replaces tomorrow's schedule. Shrink the
+            fleet to force infeasible rounds.
           </p>
         </div>
         <div className="app-header-actions">
@@ -56,8 +76,10 @@ export function CruiseRoute() {
             fleetSize={dispatch?.fleet.length ?? 0}
             onResizeFleet={resizeFleet}
             onReset={resetDispatch}
+            onSubmitTestOrder={runTestOrder}
             isResetting={isResetting}
             isResizing={isResizing}
+            isSubmittingOrder={isSubmittingOrder}
           />
         </div>
       </header>
@@ -65,7 +87,18 @@ export function CruiseRoute() {
       <div className="game-layout cruise-layout">
         <LayerCard className="panel board-panel">
           <div className="board-panel-header">
-            <PanelTabs view={panelView} onChange={setPanelView} />
+            <div className="board-panel-header-left">
+              <PanelTabs view={panelView} onChange={setPanelView} />
+              {roundStatus ? (
+                <span
+                  className="board-panel-status"
+                  data-active="true"
+                  data-variant={roundStatusIsError ? "error" : "info"}
+                >
+                  {roundStatus}
+                </span>
+              ) : null}
+            </div>
             <button
               type="button"
               className="board-panel-gear"
@@ -85,25 +118,38 @@ export function CruiseRoute() {
           {!dispatch ? (
             <div className="board-panel-loading">Connecting to director…</div>
           ) : panelView === "operations" ? (
-            <OperationsBoard dispatch={dispatch} />
+            <OperationsBoard
+              dispatch={dispatch}
+              onViewLastRound={() => setPanelView("control-room")}
+            />
           ) : (
             <DispatchControlRoom dispatch={dispatch} />
           )}
         </LayerCard>
 
-        <AgentPanel
-          agent={plannerOne}
-          title="Planner Chat"
-          description="Single-planner debug channel. Phase 5 replaces this with the Director chat + chat target toggle."
-          placeholder="Ask planner-1 to inspectSnapshot or describe a plan tweak…"
-          showRuntimeTimeline={false}
-          onResponseComplete={refresh}
-          emptyTitle="Single-planner debug mode."
-          emptyDescription="Try: 'call inspectSnapshot then submit a plan that uses one truck per outbound route.'"
+        <PlannerActivityPanel
+          dispatch={dispatch}
+          plannerStates={plannerStates}
+          isSubmittingOrder={isSubmittingOrder}
         />
       </div>
     </main>
   );
+}
+
+function buildRoundStatus(
+  directorThinking: boolean,
+  isSubmittingOrder: boolean,
+  pendingOrderId: string | undefined,
+  roundAllInvalid: boolean,
+): string | null {
+  if (isSubmittingOrder) return `Planners running${pendingOrderId ? ` for ${pendingOrderId}` : ""}…`;
+  if (directorThinking) return "Director thinking…";
+  if (pendingOrderId && roundAllInvalid) {
+    return `Round failed: ${pendingOrderId}`;
+  }
+  if (pendingOrderId) return `Pending: ${pendingOrderId}`;
+  return null;
 }
 
 function PanelTabs({

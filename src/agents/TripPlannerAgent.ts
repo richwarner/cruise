@@ -26,7 +26,11 @@ import type {
 } from "../shared/types";
 import { createCruiseModel } from "./cruiseAgentCore";
 
-const MAX_PLANNER_TURN_STEPS = 4;
+// Planner budget: inspectSnapshot + a handful of submitPlan retries when
+// validation rejects the first attempt. Default Think maxSteps is 10; 4 was
+// too tight — a planner often needs 2–4 retries to land a feasible 30+ pallet
+// plan with startMinutes on every trip.
+const MAX_PLANNER_TURN_STEPS = 8;
 const MAX_RUNTIME_EVENTS = 30;
 
 type ProposePlanArgs = {
@@ -92,18 +96,43 @@ export class TripPlannerAgent extends Think<Env, PlannerState> {
 
     try {
       const prompt = buildPlannerPrompt(args.snapshot, args.newOrder);
+      console.log(
+        `[planner:${this.name}] proposePlan start seed=${args.seed} promptLen=${prompt.length}`,
+      );
 
-      await this.saveMessages([
+      const result = await this.saveMessages([
         {
           id: `${INTERNAL_TURN_MESSAGE_ID_PREFIX}${crypto.randomUUID()}`,
           role: "user",
           parts: [{ type: "text", text: prompt }],
         },
       ]);
+      console.log(
+        `[planner:${this.name}] saveMessages returned status=${result.status} requestId=${result.requestId}`,
+      );
 
       const after = this.ensurePlannerState();
+      const messageCount = this.getMessages().length;
+      const lastMessage = this.getMessages().at(-1);
+      console.log(
+        `[planner:${this.name}] post-turn lastCandidate=${
+          after.lastCandidate ? after.lastCandidate.valid : "none"
+        } messages=${messageCount} lastRole=${lastMessage?.role}`,
+      );
       if (after.lastCandidate) {
         return after.lastCandidate;
+      }
+
+      // Dump the last assistant message so we can see what the model actually produced
+      // when it refused to call submitPlan.
+      if (lastMessage?.role === "assistant") {
+        const text = lastMessage.parts
+          .filter((p) => p.type === "text")
+          .map((p) => ("text" in p ? p.text : ""))
+          .join("");
+        console.log(
+          `[planner:${this.name}] assistant text (no tool call) firstChars=${text.slice(0, 200)}`,
+        );
       }
 
       const fallback: PlannerCandidate = {
@@ -116,6 +145,12 @@ export class TripPlannerAgent extends Think<Env, PlannerState> {
       };
       this.setState({ ...after, lastCandidate: fallback });
       return fallback;
+    } catch (error) {
+      console.error(
+        `[planner:${this.name}] proposePlan threw`,
+        error instanceof Error ? error.stack : error,
+      );
+      throw error;
     } finally {
       const current = this.ensurePlannerState();
       this.setState({ ...current, plannerThinking: false });
@@ -180,6 +215,10 @@ Never claim a plan was accepted unless submitPlan returns ok:true.`;
           const state = this.ensurePlannerState();
           const snapshot = state.snapshot;
           if (!snapshot) {
+            this.recordRuntimeEvent(
+              "submitPlan aborted",
+              "No snapshot available",
+            );
             return {
               ok: false,
               errors: ["No snapshot available — proposePlan was not called."],
@@ -197,6 +236,10 @@ Never claim a plan was accepted unless submitPlan returns ok:true.`;
           this.setState({ ...state, lastCandidate: candidate });
 
           if (result.ok) {
+            this.recordRuntimeEvent(
+              "submitPlan accepted",
+              `€${candidate.cost} · ${result.view.trucksUsed} truck(s) · ${(plan as Plan).trips.length} trip(s)`,
+            );
             return {
               ok: true,
               data: {
@@ -207,6 +250,10 @@ Never claim a plan was accepted unless submitPlan returns ok:true.`;
             };
           }
 
+          this.recordRuntimeEvent(
+            "submitPlan rejected",
+            `${result.errors.length} error(s): ${result.errors.slice(0, 2).join("; ")}`,
+          );
           return { ok: false, errors: result.errors };
         },
       }),
