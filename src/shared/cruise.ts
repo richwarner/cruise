@@ -128,10 +128,29 @@ export function simulateTrip(trip: Trip, fleet: Truck[]): TripTimeline {
 // Cost
 // =============================================================================
 
+/**
+ * Canonical set of pallets carried by a trip, derived from the per-stop
+ * `pickupPalletIds`. This is the single source of truth the simulator and
+ * validator use; `trip.palletIds` is a denormalisation that planners sometimes
+ * forget to populate, so we do not rely on it here.
+ */
+export function tripCarriedPalletIds(trip: Trip): string[] {
+  const ids: string[] = [];
+  const seen = new Set<string>();
+  for (const stop of trip.stops) {
+    for (const pid of stop.pickupPalletIds) {
+      if (seen.has(pid)) continue;
+      seen.add(pid);
+      ids.push(pid);
+    }
+  }
+  return ids;
+}
+
 export function computeTripCost(trip: Trip, pallets: Pallet[]): number {
   const byId = new Map(pallets.map((p) => [p.id, p]));
   let total = 0;
-  for (const pid of trip.palletIds) {
+  for (const pid of tripCarriedPalletIds(trip)) {
     const p = byId.get(pid);
     if (!p) continue;
     total += ratePerPallet(p.pickup, p.dropoff);
@@ -235,6 +254,23 @@ export function validatePlan(
       }
     }
 
+    if (trip.palletIds.length > 0) {
+      const carried = tripCarriedPalletIds(trip);
+      const carriedSet = new Set(carried);
+      const declaredSet = new Set(trip.palletIds);
+      const missingInDeclared = carried.filter((id) => !declaredSet.has(id));
+      const extraInDeclared = trip.palletIds.filter(
+        (id) => !carriedSet.has(id),
+      );
+      if (missingInDeclared.length > 0 || extraInDeclared.length > 0) {
+        errors.push(
+          `Trip ${trip.id} palletIds (${trip.palletIds.join(",") || "-"}) ` +
+            `disagrees with stop pickups (${carried.join(",") || "-"}). ` +
+            `Fill trip.palletIds with every pallet picked up on this trip.`,
+        );
+      }
+    }
+
     let timeline: TripTimeline;
     try {
       timeline = simulateTrip(trip, fleet);
@@ -292,6 +328,21 @@ export function validatePlan(
   }
 
   const totalCost = computePlanCost(plan, pallets);
+
+  // Sanity floor: a plan that moves real pallets cannot cost €0 under the
+  // rate card. If this fires it means either (a) every pallet picked up has
+  // pickup === dropoff (a degenerate order) or (b) cost computation drifted
+  // from the simulator's carried-pallet set. Either way, refuse to commit.
+  const carriedPalletCount = pallets.length - plan.unassignedPalletIds.length;
+  if (totalCost === 0 && carriedPalletCount > 0) {
+    return {
+      ok: false,
+      errors: [
+        `Plan claims to move ${carriedPalletCount} pallet(s) at €0 — that's impossible under the rate card. Check pallet pickup/dropoff cities (likely pickup === dropoff) or the trip's stop.pickupPalletIds.`,
+      ],
+    };
+  }
+
   const totalDrivingHours = timelines.reduce((s, t) => s + t.drivingHours, 0);
 
   return {
@@ -339,17 +390,24 @@ export function tryApplyPlan(
 // Seed data — fleet
 // =============================================================================
 
-/** First 10 truck start-cities in canonical order. Matches PLAN.md section 5.4. */
+/**
+ * First 10 truck start-cities in canonical order. Weighted toward the two
+ * biggest demand centres (Lisbon + Porto) and lean elsewhere, so the
+ * initial state isn't a boring 2-per-city grid. The Director and planners
+ * have to reason about imbalance from turn one.
+ *
+ *   LIS × 3, OPO × 3, BRA × 2, COI × 1, FAO × 1
+ */
 const CANONICAL_FLEET_CITIES: CityId[] = [
   "LIS",
   "LIS",
+  "LIS",
   "OPO",
   "OPO",
-  "COI",
-  "COI",
+  "OPO",
   "BRA",
   "BRA",
-  "FAO",
+  "COI",
   "FAO",
 ];
 
@@ -646,12 +704,74 @@ export const SAMPLE_ORDER_TEMPLATES: string[] = [
 // =============================================================================
 
 /**
- * Identical prompt across all three planners. Variation comes only from the
- * per-planner `sessionAffinity` passed to `createCruiseModel`.
+ * Minimal persona contract the prompt builder needs. Kept structural so we
+ * don't take a runtime dependency from `src/shared/cruise.ts` onto the
+ * agent-side `PLANNER_PERSONAS` map (shared code stays free of the `agents/`
+ * layer, tests stay lightweight).
+ */
+export type PlannerPromptPersona = {
+  id: 1 | 2 | 3;
+  label: string;
+  strategyClause: string;
+  useSessionTrends: boolean;
+};
+
+/**
+ * Render a SessionTrends snapshot as a bulleted block suitable for the
+ * Strategist planner's prompt. Returns an empty string when there's
+ * nothing useful yet (no committed rounds and no obvious busiest lane),
+ * so the prompt stays compact on a fresh session.
+ */
+export function formatSessionTrendsForPrompt(trends: SessionTrends): string {
+  if (
+    trends.totalRounds === 0 &&
+    trends.busiestLanes.length === 0
+  ) {
+    return "";
+  }
+
+  const lines: string[] = [];
+
+  if (trends.totalRounds > 0) {
+    const top = trends.plannerWins[0];
+    lines.push(
+      `- Rounds committed this session: ${trends.totalRounds}` +
+        (top ? ` (top planner: ${top.planner}, ${top.wins} win(s))` : ""),
+    );
+    lines.push(
+      `- Cost trend: €${trends.costTrend.first.toFixed(0)} → €${trends.costTrend.last.toFixed(0)} ` +
+        `(${trends.costTrend.direction}, avg Δ/round €${trends.avgDeltaPerRound.toFixed(0)})`,
+    );
+  }
+
+  if (trends.busiestLanes.length > 0) {
+    const laneStr = trends.busiestLanes
+      .map((l) => `${l.lane}×${l.count}`)
+      .join(", ");
+    lines.push(`- Busiest lanes in the order book: ${laneStr}`);
+  }
+
+  lines.push(
+    `- Current plan: ${trends.currentPlanStats.trips} trips on ` +
+      `${trends.currentPlanStats.trucksUsed} truck(s), ` +
+      `${trends.currentPlanStats.palletsCovered} pallets covered, ` +
+      `€${trends.currentPlanStats.cost.toFixed(0)}`,
+  );
+
+  return lines.join("\n");
+}
+
+/**
+ * Turn prompt for a single planner. Shared scaffolding (hard rules, state
+ * snapshot) is identical across all three; the persona-specific
+ * `strategyClause` and optional SessionTrends block are what make
+ * planner-1 / 2 / 3 diverge on cost and trip count.
  */
 export function buildPlannerPrompt(
   snapshot: DispatchState,
   newOrder: OrderEvent | undefined,
+  persona?: PlannerPromptPersona,
+  trends?: SessionTrends,
 ): string {
   const fleetLines = snapshot.fleet
     .map((t) => `- ${t.id} @ ${t.startCity} (cap=${t.capacity})`)
@@ -684,8 +804,20 @@ export function buildPlannerPrompt(
     ? `New order to absorb: ${newOrder.summary} (orderId=${newOrder.orderId}, ${newOrder.pallets.length} pallet(s))`
     : "No new order to absorb — re-plan or re-submit the current plan.";
 
-  return `You are a fleet planner for tomorrow's refrigerated trucking schedule.
+  const personaBlock = persona
+    ? `\nPersona: ${persona.label}. ${persona.strategyClause}\n`
+    : "";
 
+  const trendsBlock =
+    persona?.useSessionTrends && trends
+      ? (() => {
+          const body = formatSessionTrendsForPrompt(trends);
+          return body ? `\nSession trends so far:\n${body}\n` : "";
+        })()
+      : "";
+
+  return `You are a fleet planner for tomorrow's refrigerated trucking schedule.
+${personaBlock}${trendsBlock}
 Hard rules (your plan is rejected if any of these fail):
 - Every pallet in the order book (including the new order's pallets) must appear on exactly one trip. Use exactly the pallet ids listed below.
 - Each truck may be used at most once per day and must start at its current startCity.
@@ -695,8 +827,6 @@ Hard rules (your plan is rejected if any of these fail):
 - Every dropoff must complete by 18:00 (endMinutes <= 1080).
 
 Objective: minimize the total cost as computed by the rate card (sum over pallets of the rate for their pickup->dropoff route).
-
-Strategy hint: the Current plan below is already a valid, covering schedule for every existing pallet. The cheapest way to absorb a new order is usually to keep most trips as-is and add or extend just one trip that starts at the new order's pickup city (a truck with a matching startCity). Only restructure existing trips if it strictly lowers cost.
 
 Current fleet:
 ${fleetLines}
@@ -848,6 +978,12 @@ export function pickCheapestFeasible(
   return valid.reduce((best, c) => {
     if (c.cost < best.cost) return c;
     if (c.cost > best.cost) return best;
+    // Tie on cost: prefer fewer trips (less fleet utilisation / lower
+    // operational overhead).
+    const cTrips = c.plan.trips.length;
+    const bestTrips = best.plan.trips.length;
+    if (cTrips < bestTrips) return c;
+    if (cTrips > bestTrips) return best;
     if (c.seed < best.seed) return c;
     if (c.seed > best.seed) return best;
     return c.plannerName < best.plannerName ? c : best;
@@ -961,4 +1097,96 @@ export function summarizePlan(plan: Plan): string {
   const trucks = new Set(plan.trips.map((t) => t.truckId)).size;
   const pallets = plan.trips.reduce((s, t) => s + t.palletIds.length, 0);
   return `${tripCount} trip(s), ${trucks} truck(s), ${pallets} pallet(s)`;
+}
+
+/**
+ * Read-only summary of the current session, derived live from the same
+ * `recentRounds` + `currentPlan` + `pallets` we already persist. No extra
+ * state is stored — the Control Room panel and the Strategist planner
+ * prompt both recompute from this function whenever they need a snapshot.
+ */
+export type SessionTrends = {
+  totalRounds: number;
+  plannerWins: Array<{ planner: string; wins: number; pctOfRounds: number }>;
+  costTrend: {
+    first: number;
+    last: number;
+    delta: number;
+    direction: "down" | "up" | "flat";
+  };
+  /** Mean of (cost - priorCost) across `recentRounds`. */
+  avgDeltaPerRound: number;
+  /** Top pickup→dropoff lanes across pallets, most-used first. */
+  busiestLanes: Array<{ lane: string; count: number }>;
+  currentPlanStats: {
+    trips: number;
+    trucksUsed: number;
+    palletsCovered: number;
+    cost: number;
+  };
+};
+
+const BUSIEST_LANES_CAP = 3;
+
+/**
+ * Compute a `SessionTrends` snapshot from `DispatchState`. Pure function.
+ * Safe to call on a fresh dispatch state (no rounds yet) — returns a
+ * well-formed trends object with zeros and empty arrays.
+ */
+export function computeSessionTrends(state: DispatchState): SessionTrends {
+  const rounds = state.recentRounds ?? [];
+  const totalRounds = rounds.length;
+
+  // Planner win tally. Iterate in insertion order so ties break stably
+  // toward the planner that won first.
+  const winCounts = new Map<string, number>();
+  for (const r of rounds) {
+    winCounts.set(r.winnerPlanner, (winCounts.get(r.winnerPlanner) ?? 0) + 1);
+  }
+  const plannerWins = Array.from(winCounts.entries())
+    .map(([planner, wins]) => ({
+      planner,
+      wins,
+      pctOfRounds: totalRounds === 0 ? 0 : wins / totalRounds,
+    }))
+    .sort((a, b) => b.wins - a.wins || a.planner.localeCompare(b.planner));
+
+  const first = rounds[0]?.cost ?? 0;
+  const last = rounds[rounds.length - 1]?.cost ?? 0;
+  const delta = last - first;
+  const direction: SessionTrends["costTrend"]["direction"] =
+    delta < 0 ? "down" : delta > 0 ? "up" : "flat";
+
+  const avgDeltaPerRound =
+    totalRounds === 0
+      ? 0
+      : rounds.reduce((sum, r) => sum + (r.cost - r.priorCost), 0) / totalRounds;
+
+  const laneCounts = new Map<string, number>();
+  for (const p of state.pallets) {
+    const lane = `${p.pickup}->${p.dropoff}`;
+    laneCounts.set(lane, (laneCounts.get(lane) ?? 0) + 1);
+  }
+  const busiestLanes = Array.from(laneCounts.entries())
+    .map(([lane, count]) => ({ lane, count }))
+    .sort((a, b) => b.count - a.count || a.lane.localeCompare(b.lane))
+    .slice(0, BUSIEST_LANES_CAP);
+
+  const trucksUsed = new Set(state.currentPlan.trips.map((t) => t.truckId)).size;
+  const palletsCovered =
+    state.pallets.length - state.currentPlan.unassignedPalletIds.length;
+
+  return {
+    totalRounds,
+    plannerWins,
+    costTrend: { first, last, delta, direction },
+    avgDeltaPerRound,
+    busiestLanes,
+    currentPlanStats: {
+      trips: state.currentPlan.trips.length,
+      trucksUsed,
+      palletsCovered,
+      cost: computePlanCost(state.currentPlan, state.pallets),
+    },
+  };
 }

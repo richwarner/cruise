@@ -1,66 +1,20 @@
-import { CITY_IDS, type CityId, type DispatchState } from "../../shared/types";
+import type { DispatchState } from "../../shared/types";
 import {
-  TRAVEL_TIME_MATRIX,
   computePlanCost,
-  ratePerPallet,
+  pickCheapestFeasible,
 } from "../../shared/cruise";
-import { cityLabel } from "./CityMap";
 import { PlannerCandidateCard } from "./PlannerCandidateCard";
+import { SessionTrendsPanel } from "./SessionTrendsPanel";
 
 type DispatchControlRoomProps = {
   dispatch: DispatchState;
 };
 
 export function DispatchControlRoom({ dispatch }: DispatchControlRoomProps) {
-  const fleetByCity = groupFleet(dispatch);
   const cost = computePlanCost(dispatch.currentPlan, dispatch.pallets);
 
   return (
     <div className="control-room">
-      <section className="control-room-section">
-        <h3>Fleet ({dispatch.fleet.length})</h3>
-        <table className="control-room-table">
-          <thead>
-            <tr>
-              <th>City</th>
-              <th>Trucks</th>
-              <th>IDs</th>
-            </tr>
-          </thead>
-          <tbody>
-            {(CITY_IDS as readonly CityId[]).map((c) => (
-              <tr key={c}>
-                <td>{cityLabel(c)}</td>
-                <td>{fleetByCity[c]?.length ?? 0}</td>
-                <td className="control-room-mono">
-                  {(fleetByCity[c] ?? [])
-                    .map((t) => t.id.replace(/^TRK-/, ""))
-                    .join(", ") || "—"}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </section>
-
-      <section className="control-room-section">
-        <h3>Rate card (€/pallet)</h3>
-        <div className="control-room-matrix">
-          <RouteMatrix
-            cells={(a, b) => (a === b ? "—" : `€${ratePerPallet(a, b)}`)}
-          />
-        </div>
-      </section>
-
-      <section className="control-room-section">
-        <h3>Travel matrix (hours)</h3>
-        <div className="control-room-matrix">
-          <RouteMatrix
-            cells={(a, b) => (a === b ? "—" : `${TRAVEL_TIME_MATRIX[a][b]}h`)}
-          />
-        </div>
-      </section>
-
       <section className="control-room-section">
         <h3>Current plan</h3>
         <dl className="control-room-kv">
@@ -82,6 +36,8 @@ export function DispatchControlRoom({ dispatch }: DispatchControlRoomProps) {
           </div>
         </dl>
       </section>
+
+      <SessionTrendsPanel dispatch={dispatch} />
 
       <section className="control-room-section">
         <h3>Last planner round</h3>
@@ -129,56 +85,18 @@ export function DispatchControlRoom({ dispatch }: DispatchControlRoomProps) {
   );
 }
 
-function RouteMatrix({
-  cells,
-}: {
-  cells: (from: CityId, to: CityId) => string;
-}) {
-  const ids = CITY_IDS as readonly CityId[];
-  return (
-    <table className="control-room-table control-room-matrix-table">
-      <thead>
-        <tr>
-          <th></th>
-          {ids.map((c) => (
-            <th key={c}>{c}</th>
-          ))}
-        </tr>
-      </thead>
-      <tbody>
-        {ids.map((a) => (
-          <tr key={a}>
-            <th>{a}</th>
-            {ids.map((b) => (
-              <td key={b}>{cells(a, b)}</td>
-            ))}
-          </tr>
-        ))}
-      </tbody>
-    </table>
-  );
-}
-
-function groupFleet(dispatch: DispatchState) {
-  const map: Partial<Record<CityId, typeof dispatch.fleet>> = {};
-  for (const t of dispatch.fleet) {
-    (map[t.startCity] ??= []).push(t);
-  }
-  return map;
-}
-
-/** Winner = cheapest valid candidate in the round. */
+/**
+ * Winner = what the Director would commit. Delegates to `pickCheapestFeasible`
+ * so the "WINNER" chip always matches the Director's actual tiebreak order
+ * (cost → trip count → seed → plannerName). Without this the UI could
+ * highlight a different candidate than the one that actually got committed,
+ * which is very confusing when diagnosing cost or tie-break bugs.
+ */
 function isWinningCandidate(
   candidate: DispatchState["lastRound"][number],
   round: DispatchState["lastRound"],
 ): boolean {
   if (!candidate.valid) return false;
-  const valid = round.filter(
-    (c) => c.valid && typeof c.cost === "number",
-  ) as Array<
-    DispatchState["lastRound"][number] & { valid: true; cost: number }
-  >;
-  if (valid.length === 0) return false;
-  const best = valid.reduce((a, b) => (a.cost <= b.cost ? a : b));
-  return best.plannerName === candidate.plannerName;
+  const winner = pickCheapestFeasible(round);
+  return winner !== null && winner.plannerName === candidate.plannerName;
 }

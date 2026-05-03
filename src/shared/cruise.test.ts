@@ -6,6 +6,7 @@ import {
   buildInitialPlan,
   computePlanCost,
   computeRoundCommit,
+  computeSessionTrends,
   EARLIEST_START_MINUTES,
   MAX_DRIVING_HOURS,
   pickCheapestFeasible,
@@ -16,11 +17,17 @@ import {
   TRUCK_CAPACITY,
   validatePlan,
 } from "./cruise";
+import {
+  palletSchema,
+  submitOrderInputSchema,
+} from "./schemas";
 import type {
+  DispatchState,
   OrderEvent,
   Pallet,
   Plan,
   PlannerCandidate,
+  RoundResult,
   Trip,
   Truck,
 } from "./types";
@@ -52,27 +59,40 @@ describe("ratePerPallet", () => {
 });
 
 describe("buildFleet", () => {
-  it("produces 10 trucks in canonical order by default", () => {
+  it("produces the canonical demand-weighted 10-truck fleet", () => {
     const fleet = buildFleet(10);
     expect(fleet).toHaveLength(10);
     expect(fleet.map((t) => t.startCity)).toEqual([
       "LIS",
       "LIS",
+      "LIS",
       "OPO",
       "OPO",
-      "COI",
-      "COI",
+      "OPO",
       "BRA",
       "BRA",
-      "FAO",
+      "COI",
       "FAO",
     ]);
+
+    // Counts we rely on in the demo + prompts: LIS=3, OPO=3, BRA=2, COI=1, FAO=1.
+    const counts = fleet.reduce<Record<string, number>>((acc, t) => {
+      acc[t.startCity] = (acc[t.startCity] ?? 0) + 1;
+      return acc;
+    }, {});
+    expect(counts).toEqual({ LIS: 3, OPO: 3, BRA: 2, COI: 1, FAO: 1 });
+  });
+
+  it("covers all five cities at fleetSize=10 so no city is stranded", () => {
+    const fleet = buildFleet(10);
+    const cities = new Set(fleet.map((t) => t.startCity));
+    expect(cities.size).toBe(5);
   });
 
   it("takes the first N entries when fleetSize < 10", () => {
     const fleet = buildFleet(3);
     expect(fleet).toHaveLength(3);
-    expect(fleet.map((t) => t.startCity)).toEqual(["LIS", "LIS", "OPO"]);
+    expect(fleet.map((t) => t.startCity)).toEqual(["LIS", "LIS", "LIS"]);
   });
 
   it("round-robins when fleetSize > 10", () => {
@@ -305,6 +325,71 @@ describe("validatePlan", () => {
     ).toBe(true);
   });
 
+  it("rejects a trip whose declared palletIds disagree with stop pickups", () => {
+    const firstTrip = validPlan.trips[0];
+    const bogus: Trip = {
+      ...firstTrip,
+      palletIds: [...firstTrip.palletIds, "GHOST-PALLET"],
+    };
+    const plan: Plan = {
+      ...validPlan,
+      trips: [bogus, ...validPlan.trips.slice(1)],
+    };
+    const result = validatePlan(plan, fleet, pallets);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected failure");
+    expect(
+      result.errors.some((e) => e.includes("disagrees with stop pickups")),
+    ).toBe(true);
+  });
+
+  it("rejects a plan whose total cost is €0 while carrying pallets", () => {
+    // Construct a single-city round trip: LIS pickup → LIS dropoff. The
+    // validator shouldn't reach the cost sanity floor via ordinary seed data,
+    // so we build a degenerate pallet here to force the path. This models
+    // the real-world case the fix is meant to catch: a planner submitting
+    // stops that picked up 1+ pallets but cost somehow evaluated to €0
+    // (e.g. because the pallet had pickup === dropoff).
+    const lisTruck: Truck = {
+      id: "T-ZERO",
+      sizeMeters: 13.5,
+      capacity: 30,
+      startCity: "LIS",
+    };
+    const zeroPallet: Pallet = {
+      id: "ZERO-1",
+      orderId: "ZERO",
+      pickup: "LIS",
+      dropoff: "LIS",
+    };
+    const trip: Trip = {
+      id: "TR-ZERO",
+      truckId: lisTruck.id,
+      startMinutes: EARLIEST_START_MINUTES,
+      stops: [
+        { city: "LIS", pickupPalletIds: ["ZERO-1"], dropoffPalletIds: [] },
+        { city: "LIS", pickupPalletIds: [], dropoffPalletIds: ["ZERO-1"] },
+      ],
+      palletIds: ["ZERO-1"],
+    };
+    const plan: Plan = { trips: [trip], unassignedPalletIds: [] };
+    const result = validatePlan(plan, [lisTruck], [zeroPallet]);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected failure");
+    expect(
+      result.errors.some((e) => e.includes("impossible under the rate card")),
+    ).toBe(true);
+  });
+
+  it("accepts a trip with empty palletIds when stop pickups are complete", () => {
+    const planWithEmpty: Plan = {
+      ...validPlan,
+      trips: validPlan.trips.map((t) => ({ ...t, palletIds: [] })),
+    };
+    const result = validatePlan(planWithEmpty, fleet, pallets);
+    expect(result.ok).toBe(true);
+  });
+
   it("rejects a trip whose last dropoff lands after 18:00", () => {
     // OPO→FAO is 5.75h driving; with a late start the endMinutes > 18:00.
     const opoTruck: Truck = fleet.find((t) => t.startCity === "OPO")!;
@@ -346,6 +431,22 @@ describe("computePlanCost", () => {
       }
     }
     expect(computePlanCost(plan, pallets)).toBe(expected);
+  });
+
+  // Regression: a planner that populated stop pickups but forgot to fill
+  // trip.palletIds used to report €0 for plans that obviously move pallets,
+  // because computeTripCost iterated over the empty denormalised field.
+  it("derives cost from stop.pickupPalletIds, ignoring an empty trip.palletIds", () => {
+    const fleet = buildFleet(10);
+    const pallets = buildInitialPallets();
+    const plan = buildInitialPlan(fleet, pallets);
+    const planWithEmptyPalletIds: Plan = {
+      ...plan,
+      trips: plan.trips.map((t) => ({ ...t, palletIds: [] })),
+    };
+    const expected = computePlanCost(plan, pallets);
+    expect(expected).toBeGreaterThan(0);
+    expect(computePlanCost(planWithEmptyPalletIds, pallets)).toBe(expected);
   });
 });
 
@@ -447,9 +548,53 @@ describe("pickCheapestFeasible", () => {
       candidate(1, true, 400, "p-C"),
     ];
     const winner = pickCheapestFeasible(round);
-    // Same cost → lower seed wins → seed=1
+    // Same cost, same (0) trip count → lower seed wins → seed=1
     expect(winner?.seed).toBe(1);
     expect(winner?.plannerName).toBe("p-C");
+  });
+
+  it("breaks cost ties by preferring the candidate with fewer trips", () => {
+    const tripsOfLength = (n: number) =>
+      Array.from({ length: n }, (_, i) => ({
+        id: `TR-${i}`,
+        truckId: `T-${i}`,
+        startMinutes: 360,
+        stops: [
+          { city: "LIS" as const, pickupPalletIds: [], dropoffPalletIds: [] },
+        ],
+        palletIds: [],
+      }));
+    const round: PlannerCandidate[] = [
+      // Same cost, different trip counts, seed ordering would otherwise pick
+      // seed=1 — the tiebreak must prefer the leaner plan (seed=3, 5 trips).
+      {
+        plannerName: "p-1",
+        seed: 1,
+        plan: { trips: tripsOfLength(8), unassignedPalletIds: [] },
+        valid: true,
+        cost: 367,
+        submittedAt: 0,
+      },
+      {
+        plannerName: "p-2",
+        seed: 2,
+        plan: { trips: tripsOfLength(7), unassignedPalletIds: [] },
+        valid: true,
+        cost: 367,
+        submittedAt: 0,
+      },
+      {
+        plannerName: "p-3",
+        seed: 3,
+        plan: { trips: tripsOfLength(5), unassignedPalletIds: [] },
+        valid: true,
+        cost: 367,
+        submittedAt: 0,
+      },
+    ];
+    const winner = pickCheapestFeasible(round);
+    expect(winner?.seed).toBe(3);
+    expect(winner?.plan.trips.length).toBe(5);
   });
 
   it("ignores infeasible candidates even when they are cheaper-looking", () => {
@@ -598,5 +743,149 @@ describe("computeRoundCommit", () => {
     // Applied state should still carry priors (recentRounds untouched here —
     // the director is responsible for appending roundResult).
     expect(decision.appliedState.recentRounds).toEqual(state.recentRounds);
+  });
+});
+
+describe("computeSessionTrends", () => {
+  function stateWithRounds(rounds: RoundResult[]): DispatchState {
+    const base = seedInitialDispatchState("trends-test", { fleetSize: 10 });
+    return { ...base, recentRounds: rounds };
+  }
+
+  function round(
+    roundId: number,
+    winner: string,
+    cost: number,
+    priorCost: number,
+  ): RoundResult {
+    return {
+      roundId,
+      orderId: `O-${roundId}`,
+      winnerPlanner: winner,
+      winnerSeed: Number(winner.match(/(\d+)$/)?.[1] ?? 0),
+      cost,
+      priorCost,
+      committedAt: 1_000_000 + roundId,
+      tripCount: 6,
+    };
+  }
+
+  it("returns zero-populated trends on an empty session", () => {
+    const state = stateWithRounds([]);
+    const trends = computeSessionTrends(state);
+
+    expect(trends.totalRounds).toBe(0);
+    expect(trends.plannerWins).toEqual([]);
+    expect(trends.costTrend).toEqual({
+      first: 0,
+      last: 0,
+      delta: 0,
+      direction: "flat",
+    });
+    expect(trends.avgDeltaPerRound).toBe(0);
+    // Busiest lanes populate from seeded pallets even without committed rounds.
+    expect(trends.busiestLanes.length).toBeGreaterThan(0);
+    expect(trends.currentPlanStats.trips).toBeGreaterThan(0);
+    expect(trends.currentPlanStats.cost).toBeGreaterThan(0);
+  });
+
+  it("summarizes a single committed round", () => {
+    const state = stateWithRounds([round(1, "planner-2", 500, 450)]);
+    const trends = computeSessionTrends(state);
+
+    expect(trends.totalRounds).toBe(1);
+    expect(trends.plannerWins).toEqual([
+      { planner: "planner-2", wins: 1, pctOfRounds: 1 },
+    ]);
+    expect(trends.costTrend).toEqual({
+      first: 500,
+      last: 500,
+      delta: 0,
+      direction: "flat",
+    });
+    expect(trends.avgDeltaPerRound).toBe(50);
+  });
+
+  it("aggregates multi-round stats with mixed winners and descending cost", () => {
+    const state = stateWithRounds([
+      round(1, "planner-1", 500, 450),
+      round(2, "planner-3", 480, 500),
+      round(3, "planner-1", 430, 480),
+      round(4, "planner-2", 410, 430),
+    ]);
+    const trends = computeSessionTrends(state);
+
+    expect(trends.totalRounds).toBe(4);
+    // Sorted by wins desc, then name asc.
+    expect(trends.plannerWins).toEqual([
+      { planner: "planner-1", wins: 2, pctOfRounds: 0.5 },
+      { planner: "planner-2", wins: 1, pctOfRounds: 0.25 },
+      { planner: "planner-3", wins: 1, pctOfRounds: 0.25 },
+    ]);
+    // first round cost = 500, last round cost = 410 → delta -90, direction down.
+    expect(trends.costTrend.first).toBe(500);
+    expect(trends.costTrend.last).toBe(410);
+    expect(trends.costTrend.delta).toBe(-90);
+    expect(trends.costTrend.direction).toBe("down");
+    // Mean of (500-450, 480-500, 430-480, 410-430) = (50 - 20 - 50 - 20) / 4 = -10.
+    expect(trends.avgDeltaPerRound).toBe(-10);
+  });
+
+  it("marks cost trend as 'up' when the session is drifting more expensive", () => {
+    const state = stateWithRounds([
+      round(1, "planner-1", 400, 380),
+      round(2, "planner-1", 460, 420),
+    ]);
+    const trends = computeSessionTrends(state);
+
+    expect(trends.costTrend.direction).toBe("up");
+    expect(trends.costTrend.delta).toBe(60);
+  });
+
+  it("reports busiest lanes from the pallet book", () => {
+    const state = stateWithRounds([]);
+    const trends = computeSessionTrends(state);
+
+    // Most common lane in the seeded book should appear first and counts
+    // should be monotonically non-increasing.
+    for (let i = 1; i < trends.busiestLanes.length; i++) {
+      expect(trends.busiestLanes[i - 1].count).toBeGreaterThanOrEqual(
+        trends.busiestLanes[i].count,
+      );
+    }
+    // Cap at 3 entries.
+    expect(trends.busiestLanes.length).toBeLessThanOrEqual(3);
+  });
+});
+
+describe("input schemas", () => {
+  it("palletSchema rejects pickup === dropoff", () => {
+    const bad = palletSchema.safeParse({
+      id: "P-1",
+      orderId: "O-1",
+      pickup: "LIS",
+      dropoff: "LIS",
+    });
+    expect(bad.success).toBe(false);
+  });
+
+  it("palletSchema accepts pickup !== dropoff", () => {
+    const good = palletSchema.safeParse({
+      id: "P-1",
+      orderId: "O-1",
+      pickup: "LIS",
+      dropoff: "OPO",
+    });
+    expect(good.success).toBe(true);
+  });
+
+  it("submitOrderInputSchema rejects pickup === dropoff", () => {
+    const bad = submitOrderInputSchema.safeParse({
+      orderId: "O-1",
+      pickup: "LIS",
+      dropoff: "LIS",
+      pallets: 2,
+    });
+    expect(bad.success).toBe(false);
   });
 });

@@ -6,6 +6,7 @@ import { useCallback, useState } from "react";
 import { DirectorChatPanel } from "../components/DirectorChatPanel";
 import { DispatchControlRoom } from "../components/DispatchControlRoom";
 import { DispatchControls, TEST_ORDER } from "../components/DispatchControls";
+import { DispatchDataView } from "../components/DispatchDataView";
 import { OperationsBoard } from "../components/OperationsBoard";
 import { PlannerActivityPanel } from "../components/PlannerActivityPanel";
 import { useDispatchSystem } from "../hooks/useDispatchSystem";
@@ -13,8 +14,10 @@ import { RouteNav } from "./RouteNav";
 
 const DEFAULT_SYSTEM_ID = "cruise-workshop";
 
-type PanelView = "operations" | "control-room";
+type PanelView = "operations" | "control-room" | "data";
 type SideView = "chat" | "activity";
+
+const PANEL_VIEW_ORDER: PanelView[] = ["operations", "control-room", "data"];
 
 /**
  * Phase 5 route: Director chat is the primary interaction surface. The left
@@ -110,11 +113,14 @@ export function CruiseRoute() {
             <button
               type="button"
               className="board-panel-gear"
-              title="Toggle panel"
+              title="Cycle panel"
               onClick={() =>
-                setPanelView((v) =>
-                  v === "operations" ? "control-room" : "operations",
-                )
+                setPanelView((v) => {
+                  const i = PANEL_VIEW_ORDER.indexOf(v);
+                  return PANEL_VIEW_ORDER[
+                    (i + 1) % PANEL_VIEW_ORDER.length
+                  ];
+                })
               }
             >
               <GearIcon size={18} weight="bold" />
@@ -130,8 +136,10 @@ export function CruiseRoute() {
               dispatch={dispatch}
               onViewLastRound={() => setPanelView("control-room")}
             />
-          ) : (
+          ) : panelView === "control-room" ? (
             <DispatchControlRoom dispatch={dispatch} />
+          ) : (
+            <DispatchDataView dispatch={dispatch} />
           )}
         </LayerCard>
 
@@ -181,30 +189,27 @@ function PanelTabs({
   view: PanelView;
   onChange: (next: PanelView) => void;
 }) {
+  const tabs: Array<{ id: PanelView; label: string }> = [
+    { id: "operations", label: "Operations" },
+    { id: "control-room", label: "Control Room" },
+    { id: "data", label: "Data" },
+  ];
   return (
     <div className="panel-tabs" role="tablist">
-      <button
-        type="button"
-        role="tab"
-        aria-selected={view === "operations"}
-        className={
-          view === "operations" ? "panel-tab panel-tab--active" : "panel-tab"
-        }
-        onClick={() => onChange("operations")}
-      >
-        Operations
-      </button>
-      <button
-        type="button"
-        role="tab"
-        aria-selected={view === "control-room"}
-        className={
-          view === "control-room" ? "panel-tab panel-tab--active" : "panel-tab"
-        }
-        onClick={() => onChange("control-room")}
-      >
-        Control Room
-      </button>
+      {tabs.map((tab) => (
+        <button
+          key={tab.id}
+          type="button"
+          role="tab"
+          aria-selected={view === tab.id}
+          className={
+            view === tab.id ? "panel-tab panel-tab--active" : "panel-tab"
+          }
+          onClick={() => onChange(tab.id)}
+        >
+          {tab.label}
+        </button>
+      ))}
     </div>
   );
 }

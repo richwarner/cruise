@@ -17,6 +17,7 @@
   --cruise-accent-soft: rgba(244, 129, 32, 0.14);
   --cruise-ok: #3fb950;
   --cruise-danger: #f85149;
+  --cruise-warning: #f5a623;
   background: var(--cruise-paper);
   color: var(--cruise-ink);
 }
@@ -330,6 +331,12 @@ code {
   background: color-mix(in srgb, var(--cruise-danger) 12%, transparent);
 }
 
+.director-round-chip[data-variant="ai_unreachable"] {
+  color: var(--cruise-warning, #f5a623);
+  border-color: var(--cruise-warning, #f5a623);
+  background: color-mix(in srgb, var(--cruise-warning, #f5a623) 14%, transparent);
+}
+
 .director-round-history {
   display: flex;
   flex-direction: column;
@@ -340,10 +347,42 @@ code {
 }
 
 .director-round-history-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
   font-size: 10px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--cruise-muted);
+}
+
+.director-round-sparkline {
+  display: block;
+}
+
+.director-round-sparkline polyline {
+  stroke: var(--cruise-muted);
+}
+
+.director-round-sparkline circle {
+  fill: var(--cruise-muted);
+}
+
+.director-round-sparkline .spark-last {
+  fill: var(--cruise-text);
+}
+
+.director-round-sparkline.cruise-down polyline,
+.director-round-sparkline.cruise-down circle {
+  stroke: var(--cruise-accent);
+  fill: var(--cruise-accent);
+}
+
+.director-round-sparkline.cruise-up polyline,
+.director-round-sparkline.cruise-up circle {
+  stroke: var(--cruise-danger);
+  fill: var(--cruise-danger);
 }
 
 .director-round-history-list {
@@ -841,22 +880,35 @@ code {
   font-weight: 600;
 }
 
+.trip-line-group {
+  cursor: pointer;
+}
+
+.trip-line-hit {
+  /* Visible when you tab-focus for accessibility; inert otherwise. */
+  outline: none;
+}
+
 .trip-line {
   stroke: var(--cruise-accent);
   color: var(--cruise-accent);
-  opacity: 0.5;
-  cursor: pointer;
-  transition: opacity 120ms ease;
+  opacity: 0.55;
+  transition: opacity 120ms ease, stroke-width 120ms ease;
 }
 
-.trip-line:hover {
-  opacity: 0.9;
+.trip-line-group:hover .trip-line {
+  opacity: 0.95;
+  stroke-width: 3;
 }
 
 .trip-line--selected {
   opacity: 1;
   stroke: var(--cruise-ok);
   color: var(--cruise-ok);
+}
+
+.trip-line-group--selected:hover .trip-line {
+  stroke: var(--cruise-ok);
 }
 
 /* Trip detail */
@@ -1082,6 +1134,120 @@ code {
   font-size: 12px;
 }
 
+.data-order-pending {
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(245, 158, 11, 0.14);
+  color: var(--cruise-warning, #f59e0b);
+  font-family: var(--cruise-font-sans, inherit);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  vertical-align: middle;
+}
+
+/* Session Trends panel */
+
+.session-trends {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.session-trends-row {
+  display: grid;
+  grid-template-columns: 90px 1fr;
+  gap: 10px;
+  align-items: center;
+}
+
+.session-trends-label {
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--cruise-muted);
+}
+
+.session-trends-bars {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.session-trends-bar {
+  display: grid;
+  grid-template-columns: 36px 1fr auto;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--cruise-text);
+}
+
+.session-trends-bar-name {
+  color: var(--cruise-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.session-trends-bar-fill {
+  display: inline-block;
+  height: 6px;
+  background: var(--cruise-accent);
+  border-radius: 999px;
+  min-width: 6px;
+  transition: width 200ms ease;
+}
+
+.session-trends-bar-count {
+  font-variant-numeric: tabular-nums;
+  color: var(--cruise-text);
+  min-width: 62px;
+  text-align: right;
+}
+
+.session-trends-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.session-trends-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  border: 1px solid var(--cruise-line);
+  border-radius: 999px;
+  font-size: 11px;
+  background: var(--cruise-panel);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.session-trends-chip[data-trend="down"] {
+  color: var(--cruise-accent);
+  border-color: var(--cruise-accent);
+  background: color-mix(in srgb, var(--cruise-accent) 10%, transparent);
+}
+
+.session-trends-chip[data-trend="up"] {
+  color: var(--cruise-danger);
+  border-color: var(--cruise-danger);
+  background: color-mix(in srgb, var(--cruise-danger) 10%, transparent);
+}
+
+.session-trends-chip[data-trend="flat"],
+.session-trends-chip[data-trend="muted"] {
+  color: var(--cruise-muted);
+}
+
+.session-trends-chip-delta {
+  font-size: 10px;
+  letter-spacing: 0.02em;
+  opacity: 0.9;
+}
+
 .control-room-candidates {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
@@ -1203,15 +1369,53 @@ code {
 
 .planner-card-header {
   display: flex;
+  align-items: center;
   justify-content: space-between;
+  gap: 6px;
   font-size: 12px;
 }
 
 .planner-card-name {
   font-weight: 600;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.planner-card-persona {
+  flex: 0 0 auto;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  padding: 2px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--cruise-line);
+  background: var(--cruise-panel);
+  color: var(--cruise-muted);
+}
+
+.planner-card-persona[data-persona="strategist"] {
+  color: var(--cruise-accent);
+  border-color: var(--cruise-accent);
+  background: color-mix(in srgb, var(--cruise-accent) 12%, transparent);
+}
+
+.planner-card-persona[data-persona="fast"] {
+  color: var(--cruise-ok);
+  border-color: var(--cruise-ok);
+  background: color-mix(in srgb, var(--cruise-ok) 12%, transparent);
+}
+
+.planner-card-persona[data-persona="deep"] {
+  color: var(--cruise-warning);
+  border-color: var(--cruise-warning);
+  background: color-mix(in srgb, var(--cruise-warning) 14%, transparent);
 }
 
 .planner-card-seed {
+  flex: 0 0 auto;
   color: var(--cruise-muted);
   font-size: 11px;
 }

@@ -35,13 +35,18 @@ import type {
   PlannerCandidate,
   PlannerState,
 } from "../shared/types";
-import { createCruiseModel } from "./cruiseAgentCore";
+import {
+  createCruiseModel,
+  looksLikeAiBindingFailure,
+  probeWorkersAI,
+} from "./cruiseAgentCore";
 import { TripPlannerAgent } from "./TripPlannerAgent";
 
 const MAX_DIRECTOR_ACTIONS = 40;
 const MAX_RECENT_ROUNDS = 10;
 const MAX_DIRECTOR_TURN_STEPS = 6;
-const PLANNER_TIMEOUT_MS = 120_000;
+const PLANNER_TIMEOUT_MS = 300_000;
+const PLANNER_TIMEOUT_LABEL = `${Math.round(PLANNER_TIMEOUT_MS / 1000)}s`;
 /**
  * Once any planner returns a valid candidate, give the slower ones this long
  * to also return a (potentially cheaper) valid plan before we commit. This
@@ -78,8 +83,15 @@ export class DispatchDirectorAgent extends Think<Env, DispatchState> {
    * resolutions from abandoned rounds compare against this to avoid
    * overwriting the current round's `lastRound` (see the grace-window
    * short-circuit in `collectPlannerCandidates`).
+   *
+   * Initialised lazily in `askPlannersInternal` from the maximum `roundId`
+   * already stored in `recentRounds`, so that when a DO evicts and its
+   * in-memory counter drops to 0, the next round ID stays strictly greater
+   * than any persisted one (otherwise `RoundResult.roundId` collides in the
+   * UI's round-history list).
    */
   private currentRoundId = 0;
+  private currentRoundIdHydrated = false;
 
   // ======== RPC (client-facing) ========
 
@@ -93,6 +105,8 @@ export class DispatchDirectorAgent extends Think<Env, DispatchState> {
     const base = createInitialDispatchState(this.name);
     const state = this.withAction(base, "Reset dispatch", `systemId=${this.name}`);
     this.setState(state);
+    this.currentRoundId = 0;
+    this.currentRoundIdHydrated = true;
     this.clearMessages();
     await this.resetAllPlanners();
     return state;
@@ -108,6 +122,8 @@ export class DispatchDirectorAgent extends Think<Env, DispatchState> {
       `${normalized} truck${normalized === 1 ? "" : "s"}`,
     );
     this.setState(state);
+    this.currentRoundId = 0;
+    this.currentRoundIdHydrated = true;
     await this.resetAllPlanners();
     return state;
   }
@@ -248,7 +264,7 @@ export class DispatchDirectorAgent extends Think<Env, DispatchState> {
   }
 
   /**
-   * Spawn the three Planner sub-agents in parallel, each with a 120 s timeout.
+   * Spawn the three Planner sub-agents in parallel, each with a 180 s timeout.
    * Merge candidates into `lastRound`, pick the cheapest feasible, and commit
    * via `tryApplyPlan`. On full failure (all three infeasible, or timeout,
    * or RPC error), leaves `currentPlan` and `pendingOrder` untouched and
@@ -275,6 +291,20 @@ export class DispatchDirectorAgent extends Think<Env, DispatchState> {
 
     const snapshot = entryState;
     const newOrder = entryState.pendingOrder;
+
+    // One-time rehydration: bump `currentRoundId` past the highest persisted
+    // roundId so eviction/reload doesn't restart the counter at 0 and cause
+    // duplicate RoundResult keys in `recentRounds`.
+    if (!this.currentRoundIdHydrated) {
+      const maxPersisted = (entryState.recentRounds ?? []).reduce(
+        (m, r) => (r.roundId > m ? r.roundId : m),
+        0,
+      );
+      if (maxPersisted > this.currentRoundId) {
+        this.currentRoundId = maxPersisted;
+      }
+      this.currentRoundIdHydrated = true;
+    }
 
     const roundId = ++this.currentRoundId;
     this.setState({
@@ -311,21 +341,30 @@ export class DispatchDirectorAgent extends Think<Env, DispatchState> {
     });
 
     if (decision.kind === "infeasible") {
+      // If *no* candidate actually reached the validator (i.e. every planner
+      // either timed out, never submitted a plan, or blew up mid-turn), the
+      // most likely cause is the Workers AI binding being unreachable rather
+      // than a genuinely infeasible order. Run a cheap probe to confirm so
+      // the UI can surface an actionable "restart dev / re-login" chip
+      // instead of implying the fleet is overloaded.
+      const classified = await this.maybeTagAiUnreachable(revalidated);
       if (roundIsCurrent) {
         const next: DispatchState = this.withAction(
           {
             ...stateAfterRound,
-            lastRound: revalidated,
+            lastRound: classified,
             directorThinking: false,
           },
-          "askPlanners infeasible",
+          classified.every((c) => c.errorKind === "ai_unreachable")
+            ? "askPlanners ai unreachable"
+            : "askPlanners infeasible",
           decision.errorDetail,
         );
         this.setState(next);
       }
       return {
         ok: false,
-        candidates: revalidated,
+        candidates: classified,
         errors: decision.errors,
       };
     }
@@ -396,7 +435,7 @@ export class DispatchDirectorAgent extends Think<Env, DispatchState> {
       this.runPlannerWithTimeout(plannerName, index + 1, snapshot, newOrder)
         .then((candidate) => {
           // Drop late resolutions from superseded rounds so they can't
-          // overwrite a newer round's lastRound (e.g. a 120s timeout
+          // overwrite a newer round's lastRound (e.g. a 180s timeout
           // resolving long after a grace-commit).
           if (this.currentRoundId !== roundId) return;
           resolved.set(plannerName, candidate);
@@ -467,17 +506,64 @@ export class DispatchDirectorAgent extends Think<Env, DispatchState> {
     this.setState({ ...current, lastRound: partial });
   }
 
+  /**
+   * If an entire round came back invalid but *none* of the planners reached
+   * the validator (every candidate is `no_plan` / `timeout` / already
+   * `ai_unreachable`), run a fast Workers AI probe. When the probe fails,
+   * re-tag every candidate as `ai_unreachable` so the chat chip can say
+   * "AI binding unreachable" instead of the ambiguous "Round failed".
+   *
+   * Skips the probe entirely if any candidate is classified `infeasible`
+   * — in that case at least one planner did reason successfully and we
+   * trust the "real" infeasibility signal.
+   */
+  private async maybeTagAiUnreachable(
+    candidates: PlannerCandidate[],
+  ): Promise<PlannerCandidate[]> {
+    if (candidates.length === 0) return candidates;
+    if (candidates.some((c) => c.errorKind === "infeasible")) {
+      return candidates;
+    }
+    // If every candidate is already ai_unreachable from runPlannerWithTimeout,
+    // we already know; skip the probe.
+    if (candidates.every((c) => c.errorKind === "ai_unreachable")) {
+      return candidates;
+    }
+    const probe = await probeWorkersAI(this.env);
+    if (probe.ok) return candidates;
+
+    this.recordDirectorAction(
+      "ai probe failed",
+      `${probe.model} · ${probe.ms}ms · ${probe.error.slice(0, 120)}`,
+    );
+    return candidates.map((c) => ({
+      ...c,
+      errorKind: "ai_unreachable" as const,
+      errors: [...(c.errors ?? []), `AI probe failed: ${probe.error}`],
+    }));
+  }
+
   private revalidateCandidate(
     candidate: PlannerCandidate,
     snapshot: DispatchState,
   ): PlannerCandidate {
-    if (!candidate.valid) return candidate;
+    if (!candidate.valid) {
+      // Preserve classification from `runPlannerWithTimeout` / planner
+      // fallback; default to `no_plan` for legacy candidates without a kind.
+      return {
+        ...candidate,
+        errorKind: candidate.errorKind ?? "no_plan",
+      } satisfies PlannerCandidate;
+    }
     const result = validatePlan(candidate.plan, snapshot.fleet, snapshot.pallets);
     if (!result.ok) {
+      // The planner *did* reason and submit a plan, it just violated a hard
+      // constraint. That's a true infeasibility for the UI to surface.
       return {
         ...candidate,
         valid: false,
         errors: result.errors,
+        errorKind: "infeasible",
         cost: computePlanCost(candidate.plan, snapshot.pallets),
       } satisfies PlannerCandidate;
     }
@@ -497,7 +583,12 @@ export class DispatchDirectorAgent extends Think<Env, DispatchState> {
         planner.proposePlan({ seed, snapshot, newOrder }),
         new Promise<PlannerCandidate>((_, reject) =>
           setTimeout(
-            () => reject(new Error(`planner ${plannerName} timed out after 120s`)),
+            () =>
+              reject(
+                new Error(
+                  `planner ${plannerName} timed out after ${PLANNER_TIMEOUT_LABEL}`,
+                ),
+              ),
             PLANNER_TIMEOUT_MS,
           ),
         ),
@@ -511,9 +602,15 @@ export class DispatchDirectorAgent extends Think<Env, DispatchState> {
       return result;
     } catch (error) {
       const message = error instanceof Error ? error.message : "unknown error";
+      const isTimeout = message.includes("timed out after");
+      const errorKind: PlannerCandidate["errorKind"] = isTimeout
+        ? "timeout"
+        : looksLikeAiBindingFailure(message)
+          ? "ai_unreachable"
+          : "no_plan";
       this.recordDirectorAction(
         `planner ${plannerName} error`,
-        `${message} · ${Date.now() - start}ms`,
+        `${errorKind} · ${message} · ${Date.now() - start}ms`,
       );
       return {
         plannerName,
@@ -524,6 +621,7 @@ export class DispatchDirectorAgent extends Think<Env, DispatchState> {
         },
         valid: false,
         errors: [message],
+        errorKind,
         submittedAt: Date.now(),
       };
     }

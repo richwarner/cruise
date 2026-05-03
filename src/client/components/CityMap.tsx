@@ -78,24 +78,44 @@ export function CityMap({
           .join(" ");
         const isSelected = trip.id === selectedTripId;
         return (
-          <polyline
+          <g
             key={trip.id}
             className={
-              isSelected ? "trip-line trip-line--selected" : "trip-line"
+              isSelected
+                ? "trip-line-group trip-line-group--selected"
+                : "trip-line-group"
             }
-            points={points}
-            fill="none"
-            strokeWidth={isSelected ? 3 : 1.5}
-            markerEnd="url(#arrow)"
             onClick={(e) => {
               e.stopPropagation();
               onSelectTrip?.(trip.id === selectedTripId ? undefined : trip.id);
             }}
           >
-            <title>
-              {trip.id} · {trip.truckId} · {trip.palletIds.length} pallets
-            </title>
-          </polyline>
+            {/* Invisible fat stroke that catches clicks / hover. Uses
+                pointer-events="stroke" so clicks near the line register
+                even though the visible polyline is thin. */}
+            <polyline
+              className="trip-line-hit"
+              points={points}
+              fill="none"
+              stroke="transparent"
+              strokeWidth={16}
+              pointerEvents="stroke"
+            />
+            <polyline
+              className={
+                isSelected ? "trip-line trip-line--selected" : "trip-line"
+              }
+              points={points}
+              fill="none"
+              strokeWidth={isSelected ? 3 : 2}
+              markerEnd="url(#arrow)"
+              pointerEvents="none"
+            >
+              <title>
+                {trip.id} · {trip.truckId} · {trip.palletIds.length} pallets
+              </title>
+            </polyline>
+          </g>
         );
       })}
 

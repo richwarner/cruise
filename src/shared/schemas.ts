@@ -4,12 +4,17 @@ import { CITY_IDS } from "./types";
 
 export const cityIdSchema = z.enum(CITY_IDS);
 
-export const palletSchema = z.object({
-  id: z.string().min(1).max(40),
-  orderId: z.string().min(1).max(40),
-  pickup: cityIdSchema,
-  dropoff: cityIdSchema,
-});
+export const palletSchema = z
+  .object({
+    id: z.string().min(1).max(40),
+    orderId: z.string().min(1).max(40),
+    pickup: cityIdSchema,
+    dropoff: cityIdSchema,
+  })
+  .refine((p) => p.pickup !== p.dropoff, {
+    message: "Pallet pickup and dropoff must differ.",
+    path: ["dropoff"],
+  });
 
 export const tripStopSchema = z.object({
   city: cityIdSchema,
@@ -45,13 +50,18 @@ export const askPlannersInputSchema = z.object({
  * button and by Phase 5's director tool when the dispatcher types a natural
  * language order and the LLM parses it.
  */
-export const submitOrderInputSchema = z.object({
-  orderId: z.string().min(1).max(40),
-  pickup: cityIdSchema,
-  dropoff: cityIdSchema,
-  pallets: z.number().int().min(1).max(30),
-  summary: z.string().min(1).max(240).optional(),
-});
+export const submitOrderInputSchema = z
+  .object({
+    orderId: z.string().min(1).max(40),
+    pickup: cityIdSchema,
+    dropoff: cityIdSchema,
+    pallets: z.number().int().min(1).max(30),
+    summary: z.string().min(1).max(240).optional(),
+  })
+  .refine((o) => o.pickup !== o.dropoff, {
+    message: "Order pickup and dropoff cities must differ.",
+    path: ["dropoff"],
+  });
 
 export const submitPlanInputSchema = z.object({
   plan: planSchema,

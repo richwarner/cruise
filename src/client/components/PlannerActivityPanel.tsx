@@ -2,6 +2,7 @@ import { LayerCard } from "@cloudflare/kumo/components/layer-card";
 import { Text } from "@cloudflare/kumo/components/text";
 import { BrainIcon } from "@phosphor-icons/react";
 
+import { plannerPersonaForSeed } from "../../shared/personas";
 import type {
   DispatchState,
   PlannerCandidate,
@@ -141,10 +142,19 @@ function PlannerRow({
     .filter(Boolean)
     .join(" ");
 
+  const persona = plannerPersonaForSeed(seed);
+
   return (
     <article className={className}>
       <header className="planner-card-header">
         <span className="planner-card-name">{plannerName}</span>
+        <span
+          className="planner-card-persona"
+          data-persona={persona.keyword}
+          title={`${persona.label} · reasoning=${persona.reasoningEffort}${persona.useSessionTrends ? " · uses session trends" : ""}`}
+        >
+          {persona.label}
+        </span>
         <span className="planner-card-seed">seed {seed}</span>
       </header>
 

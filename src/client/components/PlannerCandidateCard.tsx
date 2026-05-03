@@ -1,3 +1,4 @@
+import { plannerPersonaForSeed } from "../../shared/personas";
 import type { PlannerCandidate } from "../../shared/types";
 
 type PlannerCandidateCardProps = {
@@ -17,10 +18,19 @@ export function PlannerCandidateCard({
     .filter(Boolean)
     .join(" ");
 
+  const persona = plannerPersonaForSeed(candidate.seed);
+
   return (
     <article className={className}>
       <header className="planner-card-header">
         <span className="planner-card-name">{candidate.plannerName}</span>
+        <span
+          className="planner-card-persona"
+          data-persona={persona.keyword}
+          title={`${persona.label} · reasoning=${persona.reasoningEffort}${persona.useSessionTrends ? " · uses session trends" : ""}`}
+        >
+          {persona.label}
+        </span>
         <span className="planner-card-seed">seed {candidate.seed}</span>
       </header>
 

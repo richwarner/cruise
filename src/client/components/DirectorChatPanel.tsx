@@ -64,10 +64,22 @@ export function DirectorChatPanel({
             className="director-round-history"
             aria-label="Committed rounds this session"
           >
-            <div className="director-round-history-label">Committed rounds</div>
+            <div className="director-round-history-label">
+              <span>Committed rounds</span>
+              {history.length >= 2 ? (
+                <CostSparkline rounds={history} />
+              ) : null}
+            </div>
             <ol className="director-round-history-list">
               {history.slice(-MAX_HISTORY_PILLS).map((round) => (
-                <RoundHistoryPill key={round.roundId} round={round} />
+                // Compose the key from orderId + committedAt: roundId alone
+                // can collide when a Durable Object evicts and its in-memory
+                // `currentRoundId` counter restarts at 0 (recentRounds is
+                // persisted across evictions; the counter is not).
+                <RoundHistoryPill
+                  key={`${round.orderId}-${round.committedAt}`}
+                  round={round}
+                />
               ))}
             </ol>
           </section>
@@ -79,6 +91,67 @@ export function DirectorChatPanel({
 }
 
 const MAX_HISTORY_PILLS = 6;
+
+/**
+ * Tiny inline SVG sparkline of `cost` over the last ~10 committed rounds.
+ * Shows whether the Director is converging on a cheaper plan over the
+ * session or drifting upward as orders pile on. Read-only — no tooltips,
+ * clicks, or axes (the pills below carry the detail).
+ */
+function CostSparkline({ rounds }: { rounds: RoundResult[] }) {
+  const width = 90;
+  const height = 16;
+  const padX = 2;
+  const padY = 2;
+
+  const costs = rounds.map((r) => r.cost);
+  const min = Math.min(...costs);
+  const max = Math.max(...costs);
+  const range = max - min || 1;
+
+  const stepX = rounds.length > 1 ? (width - padX * 2) / (rounds.length - 1) : 0;
+  const points = costs
+    .map((cost, i) => {
+      const x = padX + i * stepX;
+      // Invert y so lower cost is higher on the chart.
+      const y = padY + (1 - (cost - min) / range) * (height - padY * 2);
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .join(" ");
+
+  const last = costs[costs.length - 1];
+  const first = costs[0];
+  const overall = last - first;
+  const overallClass =
+    overall < 0 ? "cruise-down" : overall > 0 ? "cruise-up" : "cruise-flat";
+
+  return (
+    <svg
+      className={`director-round-sparkline ${overallClass}`}
+      width={width}
+      height={height}
+      viewBox={`0 0 ${width} ${height}`}
+      aria-label={`Session cost trend: first €${first.toFixed(0)}, latest €${last.toFixed(0)}`}
+      role="img"
+    >
+      <polyline points={points} fill="none" strokeWidth={1.25} />
+      {costs.map((cost, i) => {
+        const x = padX + i * stepX;
+        const y = padY + (1 - (cost - min) / range) * (height - padY * 2);
+        const isLast = i === costs.length - 1;
+        return (
+          <circle
+            key={i}
+            cx={x}
+            cy={y}
+            r={isLast ? 1.8 : 1.1}
+            className={isLast ? "spark-last" : undefined}
+          />
+        );
+      })}
+    </svg>
+  );
+}
 
 function RoundHistoryPill({ round }: { round: RoundResult }) {
   const delta = round.cost - round.priorCost;
@@ -124,7 +197,7 @@ const DIRECTOR_SUGGESTED_PROMPTS: Array<{ label: string; text: string }> = [
 type RoundChip = {
   text: string;
   tooltip: string;
-  variant: "winner" | "failure";
+  variant: "winner" | "failure" | "ai_unreachable";
 };
 
 function buildRoundChip(dispatch: DispatchState | undefined): RoundChip | null {
@@ -141,13 +214,27 @@ function buildRoundChip(dispatch: DispatchState | undefined): RoundChip | null {
     };
   }
 
+  const pendingId = dispatch.pendingOrder?.orderId;
+  const allAiUnreachable = dispatch.lastRound.every(
+    (c) => c.errorKind === "ai_unreachable",
+  );
+  if (allAiUnreachable) {
+    return {
+      text: `AI binding unreachable${pendingId ? ` · ${pendingId}` : ""}`,
+      tooltip:
+        "Workers AI rejected the planner calls (probe also failed). " +
+        "Usually a stale auth token — restart `npm run dev` or run " +
+        "`npx wrangler login` and try again.",
+      variant: "ai_unreachable",
+    };
+  }
+
   const failed = dispatch.lastRound
     .map((c) => c.plannerName.replace(/^.*planner-/, "planner-"))
     .join(", ");
-  const pendingId = dispatch.pendingOrder?.orderId;
   return {
     text: `Round failed${pendingId ? ` · ${pendingId}` : ""}`,
-    tooltip: `All three planners returned infeasible: ${failed}.`,
+    tooltip: `All planners returned invalid candidates: ${failed}.`,
     variant: "failure",
   };
 }

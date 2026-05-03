@@ -3,6 +3,7 @@ import { Hono } from "hono";
 
 import { DispatchDirectorAgent } from "../agents/DispatchDirectorAgent";
 import { TripPlannerAgent } from "../agents/TripPlannerAgent";
+import { CRUISE_PROBE_MODEL_ID, probeWorkersAI } from "../agents/cruiseAgentCore";
 
 // Re-export the Durable Object classes so Wrangler can find them.
 export { DispatchDirectorAgent, TripPlannerAgent };
@@ -18,33 +19,9 @@ app.get("/api/health", (c) => c.json({ ok: true, service: "cruise" }));
  * planner rounds still fail, the issue is in our prompt / tool schema.
  */
 app.get("/api/ai-probe", async (c) => {
-  const model = c.req.query("model") ?? "@cf/meta/llama-3.1-8b-instruct";
-  const start = Date.now();
-  try {
-    const result = await c.env.AI.run(model as Parameters<typeof c.env.AI.run>[0], {
-      messages: [
-        { role: "system", content: "Reply with exactly one short sentence." },
-        { role: "user", content: "Say hello from the AI probe." },
-      ],
-    } as Parameters<typeof c.env.AI.run>[1]);
-    return c.json({
-      ok: true,
-      model,
-      ms: Date.now() - start,
-      result,
-    });
-  } catch (error) {
-    return c.json(
-      {
-        ok: false,
-        model,
-        ms: Date.now() - start,
-        error: error instanceof Error ? error.message : String(error),
-        errorName: error instanceof Error ? error.name : undefined,
-      },
-      { status: 500 },
-    );
-  }
+  const model = c.req.query("model") ?? CRUISE_PROBE_MODEL_ID;
+  const result = await probeWorkersAI(c.env, model);
+  return c.json(result, { status: result.ok ? 200 : 500 });
 });
 
 export default {

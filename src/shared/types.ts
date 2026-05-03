@@ -35,6 +35,26 @@ export type Plan = {
   unassignedPalletIds: string[];
 };
 
+/**
+ * Classification of why a candidate is invalid (only set when `valid: false`).
+ *
+ *  - `infeasible`: the planner returned a plan that violates a constraint
+ *    (capacity, hours, etc.). The LLM reasoned correctly but picked a bad
+ *    plan — this is the "demo" failure we want the operator to see and
+ *    retry with more fleet.
+ *  - `no_plan`: the planner ran to completion but never called submitPlan.
+ *    Usually means it refused, got confused, or the think loop exhausted.
+ *  - `timeout`: the Director gave up on the planner after `PLANNER_TIMEOUT_MS`.
+ *  - `ai_unreachable`: the Workers AI binding itself returned an auth /
+ *    refresh / gateway error. Distinguished so the UI can say "restart
+ *    dev" instead of implying the plan was truly infeasible.
+ */
+export type PlannerErrorKind =
+  | "infeasible"
+  | "no_plan"
+  | "timeout"
+  | "ai_unreachable";
+
 export type PlannerCandidate = {
   plannerName: string;
   seed: number;
@@ -42,6 +62,7 @@ export type PlannerCandidate = {
   valid: boolean;
   cost?: number;
   errors?: string[];
+  errorKind?: PlannerErrorKind;
   submittedAt: number;
 };
 

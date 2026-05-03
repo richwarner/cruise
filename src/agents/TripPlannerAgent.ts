@@ -14,6 +14,7 @@ import { INTERNAL_TURN_MESSAGE_ID_PREFIX } from "../shared/messages";
 import { submitPlanInputSchema } from "../shared/schemas";
 import {
   buildPlannerPrompt,
+  computeSessionTrends,
   makeCandidate,
   validatePlan,
 } from "../shared/cruise";
@@ -24,7 +25,10 @@ import type {
   PlannerCandidate,
   PlannerState,
 } from "../shared/types";
-import { createCruiseModel } from "./cruiseAgentCore";
+import {
+  createCruiseModel,
+  plannerPersonaForName,
+} from "./cruiseAgentCore";
 
 // Planner budget: inspectSnapshot + a handful of submitPlan retries when
 // validation rejects the first attempt. Default Think maxSteps is 10; 4 was
@@ -95,9 +99,18 @@ export class TripPlannerAgent extends Think<Env, PlannerState> {
     this.setState(prepared);
 
     try {
-      const prompt = buildPlannerPrompt(args.snapshot, args.newOrder);
+      const persona = plannerPersonaForName(this.name);
+      const trends = persona.useSessionTrends
+        ? computeSessionTrends(args.snapshot)
+        : undefined;
+      const prompt = buildPlannerPrompt(
+        args.snapshot,
+        args.newOrder,
+        persona,
+        trends,
+      );
       console.log(
-        `[planner:${this.name}] proposePlan start seed=${args.seed} promptLen=${prompt.length}`,
+        `[planner:${this.name}] proposePlan start seed=${args.seed} persona=${persona.label} reasoning=${persona.reasoningEffort} promptLen=${prompt.length}`,
       );
 
       const result = await this.saveMessages([
@@ -141,6 +154,7 @@ export class TripPlannerAgent extends Think<Env, PlannerState> {
         plan: { trips: [], unassignedPalletIds: args.snapshot.pallets.map((p) => p.id) },
         valid: false,
         errors: ["Planner did not submit a plan."],
+        errorKind: "no_plan",
         submittedAt: Date.now(),
       };
       this.setState({ ...after, lastCandidate: fallback });
@@ -177,7 +191,10 @@ export class TripPlannerAgent extends Think<Env, PlannerState> {
     const state = this.ensurePlannerState();
     const lastDigit = state.plannerId.match(/(\d+)$/);
     const seed = lastDigit ? lastDigit[1] : state.plannerId;
-    return createCruiseModel(this.env, seed);
+    const persona = plannerPersonaForName(state.plannerId);
+    return createCruiseModel(this.env, seed, {
+      reasoningEffort: persona.reasoningEffort,
+    });
   }
 
   getSystemPrompt() {
