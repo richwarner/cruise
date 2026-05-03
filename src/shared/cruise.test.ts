@@ -10,7 +10,7 @@ import {
   EARLIEST_START_MINUTES,
   MAX_DRIVING_HOURS,
   pickCheapestFeasible,
-  ratePerPallet,
+  ratePerTruckLeg,
   seedInitialDispatchState,
   simulateTrip,
   travelHours,
@@ -47,14 +47,22 @@ describe("travel-time matrix", () => {
   });
 });
 
-describe("ratePerPallet", () => {
-  it("matches worked examples from PLAN.md", () => {
-    expect(ratePerPallet("LIS", "OPO")).toBe(22);
-    expect(ratePerPallet("OPO", "BRA")).toBe(9);
+describe("ratePerTruckLeg", () => {
+  it("applies the €50 + €120/h formula", () => {
+    // LIS -> OPO is 3h → round(50 + 120*3) = 410
+    expect(ratePerTruckLeg("LIS", "OPO")).toBe(410);
+    // OPO -> BRA is 0.75h → round(50 + 120*0.75) = 140
+    expect(ratePerTruckLeg("OPO", "BRA")).toBe(140);
+    // LIS -> FAO is 2.75h → round(50 + 120*2.75) = 380
+    expect(ratePerTruckLeg("LIS", "FAO")).toBe(380);
   });
 
-  it("returns 0 for same-city", () => {
-    expect(ratePerPallet("LIS", "LIS")).toBe(0);
+  it("returns 0 for same-city (no driving)", () => {
+    expect(ratePerTruckLeg("LIS", "LIS")).toBe(0);
+  });
+
+  it("is symmetric (cost is per leg, direction doesn't matter in the rate card)", () => {
+    expect(ratePerTruckLeg("LIS", "FAO")).toBe(ratePerTruckLeg("FAO", "LIS"));
   });
 });
 
@@ -344,12 +352,11 @@ describe("validatePlan", () => {
   });
 
   it("rejects a plan whose total cost is €0 while carrying pallets", () => {
-    // Construct a single-city round trip: LIS pickup → LIS dropoff. The
-    // validator shouldn't reach the cost sanity floor via ordinary seed data,
-    // so we build a degenerate pallet here to force the path. This models
-    // the real-world case the fix is meant to catch: a planner submitting
-    // stops that picked up 1+ pallets but cost somehow evaluated to €0
-    // (e.g. because the pallet had pickup === dropoff).
+    // A single-city trip with no driving legs and a degenerate (pickup ===
+    // dropoff) pallet sneaks past the per-stop checks but costs €0 under
+    // the per-truck-leg rate card. The validator's sanity floor must catch
+    // this even when the order schema would normally refuse to create such
+    // a pallet.
     const lisTruck: Truck = {
       id: "T-ZERO",
       sizeMeters: 13.5,
@@ -377,7 +384,9 @@ describe("validatePlan", () => {
     expect(result.ok).toBe(false);
     if (result.ok) throw new Error("expected failure");
     expect(
-      result.errors.some((e) => e.includes("impossible under the rate card")),
+      result.errors.some((e) =>
+        e.includes("per-truck-leg rate card"),
+      ),
     ).toBe(true);
   });
 
@@ -418,25 +427,27 @@ describe("validatePlan", () => {
 });
 
 describe("computePlanCost", () => {
-  it("sums rates for every pallet on every trip", () => {
+  it("sums the per-truck-leg rate across each trip's driving legs", () => {
     const fleet = buildFleet(10);
     const pallets = buildInitialPallets();
     const plan = buildInitialPlan(fleet, pallets);
-    const byId = new Map(pallets.map((p) => [p.id, p]));
     let expected = 0;
     for (const t of plan.trips) {
-      for (const pid of t.palletIds) {
-        const pallet = byId.get(pid)!;
-        expected += ratePerPallet(pallet.pickup, pallet.dropoff);
+      let prev: (typeof t.stops)[number]["city"] | null = null;
+      for (const stop of t.stops) {
+        if (prev !== null && prev !== stop.city) {
+          expected += ratePerTruckLeg(prev, stop.city);
+        }
+        prev = stop.city;
       }
     }
     expect(computePlanCost(plan, pallets)).toBe(expected);
   });
 
-  // Regression: a planner that populated stop pickups but forgot to fill
-  // trip.palletIds used to report €0 for plans that obviously move pallets,
-  // because computeTripCost iterated over the empty denormalised field.
-  it("derives cost from stop.pickupPalletIds, ignoring an empty trip.palletIds", () => {
+  // Regression: cost must come from the stops, not from `trip.palletIds` or
+  // `pallets`. Under the per-truck-leg model a planner could populate stops
+  // correctly but leave `trip.palletIds` empty and still get a real cost.
+  it("is independent of trip.palletIds (cost comes from the driving legs)", () => {
     const fleet = buildFleet(10);
     const pallets = buildInitialPallets();
     const plan = buildInitialPlan(fleet, pallets);
@@ -447,6 +458,50 @@ describe("computePlanCost", () => {
     const expected = computePlanCost(plan, pallets);
     expect(expected).toBeGreaterThan(0);
     expect(computePlanCost(planWithEmptyPalletIds, pallets)).toBe(expected);
+  });
+
+  it("charges the same for a full truck as for a half-full truck (consolidation incentive)", () => {
+    const lisTruck: Truck = {
+      id: "T-CONS",
+      sizeMeters: 13.5,
+      capacity: 30,
+      startCity: "LIS",
+    };
+    const soloPallet: Pallet = {
+      id: "SOLO-1",
+      orderId: "SOLO",
+      pickup: "LIS",
+      dropoff: "OPO",
+    };
+    const fullLoadPallets: Pallet[] = Array.from({ length: 10 }, (_, i) => ({
+      id: `FULL-${i}`,
+      orderId: "FULL",
+      pickup: "LIS",
+      dropoff: "OPO",
+    }));
+    const buildLisOpoTrip = (pids: string[]): Trip => ({
+      id: "TR-CONS",
+      truckId: lisTruck.id,
+      startMinutes: EARLIEST_START_MINUTES,
+      stops: [
+        { city: "LIS", pickupPalletIds: pids, dropoffPalletIds: [] },
+        { city: "OPO", pickupPalletIds: [], dropoffPalletIds: pids },
+      ],
+      palletIds: pids,
+    });
+    const soloCost = computePlanCost(
+      { trips: [buildLisOpoTrip(["SOLO-1"])], unassignedPalletIds: [] },
+      [soloPallet],
+    );
+    const fullCost = computePlanCost(
+      {
+        trips: [buildLisOpoTrip(fullLoadPallets.map((p) => p.id))],
+        unassignedPalletIds: [],
+      },
+      fullLoadPallets,
+    );
+    expect(soloCost).toBe(fullCost);
+    expect(soloCost).toBe(ratePerTruckLeg("LIS", "OPO"));
   });
 });
 
@@ -572,7 +627,7 @@ describe("pickCheapestFeasible", () => {
         seed: 1,
         plan: { trips: tripsOfLength(8), unassignedPalletIds: [] },
         valid: true,
-        cost: 367,
+        cost: 1230,
         submittedAt: 0,
       },
       {
@@ -580,7 +635,7 @@ describe("pickCheapestFeasible", () => {
         seed: 2,
         plan: { trips: tripsOfLength(7), unassignedPalletIds: [] },
         valid: true,
-        cost: 367,
+        cost: 1230,
         submittedAt: 0,
       },
       {
@@ -588,7 +643,7 @@ describe("pickCheapestFeasible", () => {
         seed: 3,
         plan: { trips: tripsOfLength(5), unassignedPalletIds: [] },
         valid: true,
-        cost: 367,
+        cost: 1230,
         submittedAt: 0,
       },
     ];

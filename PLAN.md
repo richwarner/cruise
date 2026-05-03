@@ -17,7 +17,7 @@ The reference lives at [deloreyj/chess-agent](https://github.com/deloreyj/chess-
 - Runtime: Cloudflare Workers (`wrangler 4.86`, `compatibility_date: 2026-04-28`, `nodejs_compat`).
 - Agents: `agents 0.11.6` + `@cloudflare/think 0.4.1` (Think base class handles chat, tool calls, streaming, state broadcast).
 - Storage: Durable Objects with SQLite-backed Think persistence (see migration `v1` in [wrangler.jsonc](.chess-agent-ref/wrangler.jsonc)).
-- Model: Workers AI via `workers-ai-provider 3.1.12`, model `@cf/moonshotai/kimi-k2.5` (`chessAgentCore.ts:10`).
+- Model: Workers AI via `workers-ai-provider 3.1.12`, model `@cf/moonshotai/kimi-k2.6` (`chessAgentCore.ts:10`).
 - Server: `hono 4.12.15` for `/api/health`; `routeAgentRequest` handles `/agents/*`.
 - Client: React 19 + Vite 8 + Cloudflare Vite plugin + `agents/vite` for decorator support ([vite.config.ts](.chess-agent-ref/vite.config.ts)).
 - UI kit: `@cloudflare/kumo` (granular imports) + `@cloudflare/ai-chat/react` (`useAgentChat`) + `@phosphor-icons/react`.
@@ -329,6 +329,12 @@ Sanity: a round trip OPO→LIS→OPO is 6.00h driving, under the 9h cap. OPO→F
 
 ### 5.3 Rate card
 
+> **Superseded by the per-truck-leg model — see `PROGRESS.md` Phase 9.2.**
+> The section below describes the original per-pallet rate card. In the
+> current code, `ratePerTruckLeg(from, to) = round(50 + 120 * hours)` and a
+> trip is charged per driving leg regardless of how full the truck is. The
+> original per-pallet numbers are preserved here for historical reference.
+
 `€/pallet` depends on route only. Proposed formula, encoded as a flat lookup `RATE_PER_PALLET: Record<CityId, Record<CityId, number>>`:
 
 ```txt
@@ -340,24 +346,26 @@ Worked examples:
 - OPO→BRA (0.75h): `round(0.75 * 6 + 4) = 9 €/pallet`
 - LIS→FAO (2.75h): `round(2.75 * 6 + 4) = 21 €/pallet` (stored as `20` or `21`, fix at seed time)
 
-### 5.4 Initial fleet (configurable; default 10 trucks, 2 per city)
+### 5.4 Initial fleet (configurable; default 10 trucks, demand-weighted)
 
-Distribution balanced across cities. Default 10 trucks:
+Distribution weights Lisbon and Porto (the two biggest demand centres) so
+the Director has to reason about imbalance from turn one instead of a
+trivial 2-per-city grid. Default 10 trucks:
 
 - `T01` LIS
 - `T02` LIS
-- `T03` OPO
+- `T03` LIS
 - `T04` OPO
-- `T05` COI
-- `T06` COI
+- `T05` OPO
+- `T06` OPO
 - `T07` BRA
 - `T08` BRA
-- `T09` FAO
+- `T09` COI
 - `T10` FAO
 
 All have `sizeMeters: 13.5`, `capacity: 30`.
 
-`seedInitialDispatchState(systemId, opts?: { fleetSize?: number })` parameterizes the fleet size. When `fleetSize < 10`, take the first N entries of the canonical list above (so `fleetSize: 3` yields `T01, T02, T03` — useful for forcing infeasibility demos). When `fleetSize > 10`, round-robin add extra trucks across cities (`T11` LIS, `T12` OPO, …). The UI's fleet-size selector calls `resizeFleet(n)` on the Director, which re-seeds dispatch with the new size.
+`seedInitialDispatchState(systemId, opts?: { fleetSize?: number })` parameterizes the fleet size. When `fleetSize < 10`, take the first N entries of the canonical list above (so `fleetSize: 3` yields three Lisbon trucks — useful for forcing infeasibility demos). When `fleetSize > 10`, round-robin add extra trucks across cities (`T11` LIS, `T12` OPO, …). The UI's fleet-size selector calls `resizeFleet(n)` on the Director, which re-seeds dispatch with the new size.
 
 ### 5.5 Initial order book
 
@@ -391,7 +399,7 @@ Two Durable Object classes, both extending `Think<Env, State>` for chat, streami
 Analogous to [chessAgentCore.ts](.chess-agent-ref/src/agents/chessAgentCore.ts):
 
 ```ts
-export const CRUISE_MODEL_ID = "@cf/moonshotai/kimi-k2.5";
+export const CRUISE_MODEL_ID = "@cf/moonshotai/kimi-k2.6";
 
 export function createCruiseModel(env: Env, seed?: string | number) {
   const workersAi = createWorkersAI({ binding: env.AI });

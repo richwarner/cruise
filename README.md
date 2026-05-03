@@ -2,7 +2,7 @@
 
 Prototype shipment-orchestration demo. A human dispatcher chats with an AI **Director**; when a new order arrives, the Director fans out to three **Planner** workers in parallel. Each planner re-plans tomorrow's trips to absorb the order, a deterministic validator gates every proposal, and the Director commits the cheapest feasible plan.
 
-Built on Cloudflare Workers, Durable Objects, the Agents SDK, Workers AI (Kimi K2.5 by default), Hono, React, and Kumo. Architecturally mirrors [deloreyj/chess-agent](https://github.com/deloreyj/chess-agent).
+Built on Cloudflare Workers, Durable Objects, the Agents SDK, Workers AI (Kimi K2.6 by default), Hono, React, and Kumo. Architecturally mirrors [deloreyj/chess-agent](https://github.com/deloreyj/chess-agent).
 
 Live: **https://cruise.warnerrich.workers.dev**
 
@@ -33,7 +33,7 @@ At `/cruise`:
 
 ## Architecture in one paragraph
 
-`DispatchDirectorAgent` is a `Think<Env, DispatchState>` Durable Object. It owns the fleet, orders, and current plan, and exposes both RPCs (for the UI) and tools (for its own LLM turn): `inspectDispatch`, `addOrder`, `askPlanners`, `submitOrder`. When a round runs, it uses `this.subAgent(TripPlannerAgent, name)` to call three planner DOs in parallel via `proposePlan`. Planners get a snapshot + new order, run one chat turn with their own `submitPlan` tool, and return a candidate. The Director re-runs `validatePlan` on every candidate (LLMs can't sneak past the validator), picks the cheapest valid, and replaces `currentPlan`. A 15 s grace window after the first valid candidate + a round-id guard prevent slow planners from blocking the commit or stomping on newer rounds.
+`DispatchDirectorAgent` is a `Think<Env, DispatchState>` Durable Object. It owns the fleet, orders, and current plan, and exposes both RPCs (for the UI) and tools (for its own LLM turn): `inspectDispatch`, `addOrder`, `askPlanners`, `submitOrder`. When a round runs, it uses `this.subAgent(TripPlannerAgent, name)` to call three planner DOs in parallel via `proposePlan`. Planners get a snapshot + new order, run one chat turn with their own `submitPlan` tool, and return a candidate. The Director re-runs `validatePlan` on every candidate (LLMs can't sneak past the validator), picks the cheapest valid, and replaces `currentPlan`. A 5 min grace window after the first valid candidate + a round-id guard prevent slow planners from blocking the commit or stomping on newer rounds.
 
 ## Deploy
 

@@ -19,6 +19,7 @@ The app runs on Cloudflare Workers with Durable Objects, the Agents SDK, Workers
 
 - Keep the workshop code small, explicit, and easy to teach.
 - Use `src/shared/cruise.ts` as the single source of truth for plan feasibility and cost. Nothing else validates plans.
+- **Cost model is per-truck-leg, not per-pallet.** `ratePerTruckLeg(from, to) = round(50 + 120 * hours)` charges a fixed euro amount for a truck driving a leg regardless of how full it is. Trip cost is the sum of its driving legs; plan cost is the sum of its trips. Consolidating pallets onto fewer trucks / fewer legs is the main lever planners have to reduce cost.
 - The LLM can request actions through narrow tools, but `cruise.ts` validates every proposed plan before it is persisted. "Model suggests, `cruise.ts` decides." The Director re-runs `validatePlan` on every planner candidate even when the planner reports `valid: true`.
 - Use the Agent WebSocket connection for RPC, chat, and state broadcasts. No REST API for planning.
 - Use Kumo via granular imports and standalone styles.
@@ -29,7 +30,7 @@ The app runs on Cloudflare Workers with Durable Objects, the Agents SDK, Workers
 
 ## Concurrency rules (Phase 4/5 lessons)
 
-- Planner timeouts: individual planners get up to 120 s; once any planner returns valid, a `FIRST_VALID_GRACE_MS = 15_000` window caps how long we wait for cheaper alternatives.
+- Planner timeouts: individual planners get up to 300 s; once any planner returns valid, a `FIRST_VALID_GRACE_MS = 300_000` (5 min) window caps how long we wait for cheaper alternatives. With the two limits equal, the Director effectively waits for every planner unless one hits its hard timeout.
 - Round-id guard: every `askPlannersInternal` bumps `this.currentRoundId`. Partial-round broadcasts and final commits check the id before calling `setState`; late resolutions from superseded rounds are dropped.
 - Grace-skipped planners render with `errors: ["skipped: grace window elapsed before planner returned"]`, not a fabricated timeout.
 

@@ -215,8 +215,88 @@ Live at `https://cruise.warnerrich.workers.dev`, version `fc6f180f-fc43-456e-bf2
   - Commit happy path → `RoundResult` has correct `roundId`, `committedAt`, `tripCount`, and `priorCost === cost` for a no-op commit.
 - [x] **36/36 tests green**, typecheck clean, build + deploy green.
 
-## Phase 8 backlog
+## Phase 8 — Robustness + map + demo polish ✅
+
+Live at `https://cruise.warnerrich.workers.dev`, version `2ed4d484-6aa6-47de-a8ff-80a0b8ed3960`.
+
+- [x] **AI-unreachable vs infeasible classification.** Added `PlannerErrorKind = "infeasible" | "no_plan" | "timeout" | "ai_unreachable"` to `PlannerCandidate`. `runPlannerWithTimeout` tags timeouts + binding-shaped errors; `revalidateCandidate` tags real constraint violations as `infeasible`; the `TripPlannerAgent` fallback tags `no_plan`.
+- [x] **Post-hoc probe on suspicious rounds.** `DispatchDirectorAgent.maybeTagAiUnreachable` runs a cheap Workers AI probe (via shared `probeWorkersAI` helper in `cruiseAgentCore`) only when an entire round came back invalid *and* no candidate was a genuine infeasibility. When the probe fails, every candidate gets upgraded to `ai_unreachable` so the chat chip can say "AI binding unreachable" instead of the ambiguous "Round failed". Zero extra cost on healthy rounds.
+- [x] **`/api/ai-probe` now shares the same helper** (single source of truth for probing).
+- [x] **Amber "AI binding unreachable" chip variant** in `DirectorChatPanel`. Tooltip explains the usual fix ("restart `npm run dev` or run `npx wrangler login`").
+- [x] **Cost sparkline** (`CostSparkline` in `DirectorChatPanel`). 90×16 px inline SVG in the round-history header. Plots the last ~10 `RoundResult.cost` values with a polyline + per-round dots, last dot emphasized. Line + dots go green when the trend is down over the session, red when up. Renders only once `recentRounds.length >= 2`.
+- [x] **Bigger hit area on map routes** (`CityMap.tsx`). Each trip polyline is now wrapped in a `<g>` with an invisible 16 px `stroke-width` hit polyline (`pointer-events="stroke"`) sitting under the 2 px visible polyline (`pointer-events="none"`). The visible line also bumps to 3 px on hover. Makes trips easy to click even at 1 px stroke.
+- [x] `npm run typecheck`, `npm test` (36/36), `npm run build`, `npx wrangler deploy` all green. Deployed `/api/ai-probe` smoke-tested with HTTP 200.
+
+## Phase 9 — Session Trends + planner personas ✅
+
+Live at `https://cruise.warnerrich.workers.dev`, version `14bf1808-857d-4dfb-a594-631e9df1b0fb`.
+
+Two changes that build on each other: a read-only Session Trends summary the Control Room renders on every state broadcast, and three distinct planner personas that consume (or pointedly ignore) that summary so the three candidate plans diverge on cost and trip count.
+
+- [x] **`SessionTrends` type + `computeSessionTrends` helper** (`src/shared/cruise.ts`). Pure function, no new persistence — derived live from `recentRounds` + `currentPlan` + `pallets`. Reports `totalRounds`, `plannerWins`, `costTrend` (first → last, delta, direction), `avgDeltaPerRound`, `busiestLanes` (top 3), and `currentPlanStats`. 5 new vitest cases covering empty, single-round, multi-round with mixed winners, cost-trend up/flat/down, and busiest-lanes ordering. **42/42 tests green** (up from 37).
+- [x] **Session Trends panel** (`src/client/components/SessionTrendsPanel.tsx`). Slots into `DispatchControlRoom` between "Current plan" and "Last planner round". Planner-wins rendered as inline bars (width = win %); cost-trend chip colored green/red/muted via the same palette the sparkline uses; busiest-lanes as monochrome pills. Empty state: "No rounds yet — submit an order to populate trends."
+- [x] **Three planner personas** (`src/shared/personas.ts`). Moved into a shared module so both the server (`TripPlannerAgent`, `buildPlannerPrompt`) and client (`PlannerCandidateCard`, `PlannerActivityPanel`) pull from one table:
+  - **Strategist** (id=1, reasoning=medium, uses trends): leans on what's been winning, extends the current plan.
+  - **Fast** (id=2, reasoning=low, no trends): cheapest single edit, no restructuring, no session history.
+  - **Deep** (id=3, reasoning=high, no trends): mentally drafts a conservative + an alternate-consolidation plan, submits the cheaper one.
+- [x] **Per-planner `reasoning_effort`** — `createCruiseModel(env, seed, { reasoningEffort })` threads the persona's budget into the `workers-ai-provider` model factory. Low-medium-high across the three planners creates larger behavior shifts than we'd get from a small temperature delta (and Think/AI SDK don't expose temperature per-turn cleanly — documented as out-of-scope in the plan).
+- [x] **`buildPlannerPrompt` persona-aware.** Optional `persona` + `trends` params. Splices a `Persona: X. <strategy clause>` block under the title and, for the Strategist, a `Session trends so far:` bulleted block. Scaffold (hard rules, fleet/pallets/plan snapshot, matrix) unchanged — only the bias clause differs.
+- [x] **Persona chip on candidate cards** (`PlannerCandidateCard` + `PlannerActivityPanel`). Small pill between the planner name and seed: orange "Strategist", green "Fast", amber "Deep". Tooltip includes `reasoning=medium · uses session trends` so the operator can see why planner-1's plan often differs.
+- [x] `npm run typecheck`, `npm test` (42/42), `npm run build`, `npx wrangler deploy` all green. `/api/health` smoke-tested at HTTP 200.
+
+## Phase 9.1 — Cost bug fix ✅
+
+Live at `https://cruise.warnerrich.workers.dev`, version `27dba11d-855c-46c3-8e91-a7f2a41f1fa5`.
+
+Reported by the operator: one planner candidate reported **€0** for a plan with 7 trips carrying pallets, and — because it was the cheapest valid candidate — the Director committed it, corrupting the current-plan cost display and the Session Trends sparkline.
+
+- **Root cause.** `Trip` carries two redundant representations of the pallets it moves: a flat `trip.palletIds[]` field, and `trip.stops[].pickupPalletIds[]` / `dropoffPalletIds[]` per stop. The validator and `simulateTrip` use the stop-level lists (authoritative), but `computeTripCost` iterated over `trip.palletIds`. When a planner (Fast, `reasoning_effort=low`) submitted a plan with correct stops but an empty `palletIds`, validation passed and cost silently became €0.
+- **Fix.** `computeTripCost` now derives the carried set from `trip.stops[].pickupPalletIds` via a new `tripCarriedPalletIds(trip)` helper, matching the validator's source of truth. `validatePlan` also gained a consistency rule: when a planner *does* populate `trip.palletIds`, it must equal the set derived from stop pickups — otherwise the trip is rejected with a clear "disagrees with stop pickups" error so the planner gets taught to fix it. Empty `palletIds` is accepted (stop pickups remain authoritative).
+- **Regression tests** (`src/shared/cruise.test.ts`, 42 → 45 green):
+  - `computePlanCost` returns the same non-zero total whether `trip.palletIds` is populated or empty.
+  - Validator rejects a ghost id declared in `palletIds` but absent from stop pickups.
+  - Validator accepts an empty `palletIds` when stop pickups cover every pallet.
+- `npm run typecheck`, `npm test` (45/45), `npm run build`, `npx wrangler deploy` all green.
+
+## Phase 9.2 — Per-truck-leg cost model ✅
+
+Replaces the original per-pallet rate card with a "whole truck or nothing" model so consolidation is the dominant lever planners have to reduce cost.
+
+- **New rate function.** `ratePerTruckLeg(from, to) = round(50 + 120 * hours)` — fixed per-leg dispatch overhead plus an hourly rate approximating truck + driver + fuel + refrigeration. Leg cost is independent of how many pallets are on the truck (subject to the existing `TRUCK_CAPACITY = 30` cap). Sample rates:
+  - LIS → OPO (3h): **€410**
+  - OPO → BRA (0.75h): **€140**
+  - LIS → FAO (2.75h): **€380**
+  - OPO → FAO (5.75h): **€740**
+- **`computeTripCost` rewrite.** Iterates `trip.stops` inline, emitting a leg whenever consecutive stops sit in different cities, and sums `ratePerTruckLeg` across those legs. The `pallets` argument is retained for signature stability but is no longer read — pallet count has no effect on cost. `computePlanCost` is unchanged (still sums over trips).
+- **Planner prompt refresh.** `buildPlannerPrompt` now includes a dedicated **Rate card (€/truck leg, independent of pallet count)** matrix alongside the travel-time matrix, and the Objective line explicitly states "a full truck and an empty truck cost the same for the same leg — consolidate aggressively: fewer trucks and fewer driving legs win". Personas (Strategist/Fast/Deep) and `reasoning_effort` wiring unchanged.
+- **Validator €0 sanity floor updated.** Error text now reads "under the per-truck-leg rate card every carried pallet's trip must include at least one driving leg" — still catches degenerate `pickup === dropoff` pallets that sneak past the schema refinement.
+- **UI.** `DispatchDataView`'s Rate card heading is **"Rate card (€/truck leg)"** and the cells call `ratePerTruckLeg`. No other UI changes — the Current plan / Session Trends / Last planner round / cost sparkline all route through `computePlanCost` and just display the new absolute numbers.
+- **Tests** (`src/shared/cruise.test.ts`, 50 → 52 green):
+  - `ratePerTruckLeg` asserts the worked examples (LIS→OPO €410, OPO→BRA €140, LIS→FAO €380) and the same-city / symmetry properties.
+  - `computePlanCost` sums the per-truck-leg rate over each trip's driving legs and is independent of `trip.palletIds`.
+  - New regression: a full truck and a half-full truck on the same leg produce **identical** cost (the consolidation incentive).
+  - Zero-cost sanity test updated to assert the new error substring.
+- `npm run typecheck`, `npm test` (52/52), `npm run build`, `npx wrangler deploy` all green. Operator should click **Reset dispatch** once on the live site so persisted `recentRounds` (which hold old per-pallet cost values) don't skew the Session Trends chip.
+
+## Phase 9.4 — Grace window widened to 5 min ✅
+
+- `FIRST_VALID_GRACE_MS` in `src/agents/DispatchDirectorAgent.ts` bumped from `15_000` → `300_000` (5 minutes), matching `PLANNER_TIMEOUT_MS`.
+- Rationale: with K2.6 + high `reasoning_effort` on the Deep persona, two of the three planners are regularly still thinking at T+30s when the first valid candidate arrives. A 15 s grace window was throwing away the cheaper plans. Waiting the full timeout means we get the Director's actual "cheapest feasible" objective back.
+- Trade-off: operator sees a longer "thinking" spinner when one planner is an early winner and the others are slow. Acceptable for this prototype since the round is already bounded by the 5 min hard timeout.
+- Docs (`README.md`, `AGENTS.md`, `CLOUDFLARE.md`) refreshed.
+
+## Phase 9.3 — Kimi K2.6 model bump ✅
+
+- `CRUISE_MODEL_ID` swapped from `@cf/moonshotai/kimi-k2.5` → `@cf/moonshotai/kimi-k2.6` in `src/agents/cruiseAgentCore.ts`.
+- K2.6 is a 1T-parameter frontier model with a 262k context window and the same `reasoning_effort` surface K2.5 exposed, so all three planner personas (Strategist / Fast / Deep) and the Director keep working without prompt changes.
+- Docs (`README.md`, `PLAN.md`, `CLOUDFLARE.md`) refreshed to list K2.6 as the default.
+- `worker-configuration.d.ts` does not yet enumerate K2.6 (the locally installed Workers AI types are older), but `workers-ai-provider`'s `TextGenerationModels` signature is `... | (string & {})`, so the typecheck passes and the Worker resolves the model string at runtime.
+
+## Phase 10 backlog
 
 - **Per-planner chat target** (see Phase 5 scope cut). Requires a guard that disables the planner-target tab while a round is running so we don't re-introduce planner starvation.
 - **Round history pill click-through.** Clicking a pill could scroll the chat transcript to the corresponding "committed" message or open a detail popover with the per-planner candidates archived for that round.
-- **Cost sparkline above the pill strip.** Once we have 5+ rounds, a 60 × 12 px inline sparkline across the strip would make the "plan is improving" story pop in the demo.
+- **Auto-retry on `ai_unreachable`.** When the chip goes amber, offer a "Retry" affordance that reruns the pending order once the probe succeeds. Currently the operator has to re-submit manually.
+- **Demo walkthrough (`DEMO.md`).** 3-minute script covering reset → submit → history strip → chat inspect → force infeasibility with `fleet=2`.
+- **LLM-authored Dispatch Memory** (chess-parity). The Session Trends panel covers the "what happened numerically" case. A `saveDispatchNote` tool that persists qualitative observations ("OPO→FAO orders tend to fail when fleet≤5") would complement it for longer sessions. Intentionally deferred in Phase 9.
+- **Per-planner temperature/top_p** (from the Phase 9 out-of-scope list). `reasoning_effort` is doing the work for now; revisit if the three plans still converge too often.

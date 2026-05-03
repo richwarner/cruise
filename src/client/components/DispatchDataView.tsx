@@ -1,8 +1,13 @@
 import { useMemo } from "react";
 
 import {
+  EARLIEST_START_MINUTES,
+  LATEST_END_MINUTES,
+  MAX_DRIVING_HOURS,
+  SERVICE_HOURS_PER_STOP,
   TRAVEL_TIME_MATRIX,
-  ratePerPallet,
+  TRUCK_CAPACITY,
+  ratePerTruckLeg,
 } from "../../shared/cruise";
 import {
   CITY_IDS,
@@ -25,12 +30,15 @@ type OrderSummary = {
 };
 
 /**
- * Reference data + order book for the Director and planners.
+ * Reference data + order book + validator rulebook for the Director and
+ * planners.
  *
- * The Data tab deliberately avoids anything the Director could flip round to
- * round (pending plan, last round, runtime log live in the Control Room). It
- * is the "lookup table" tab: what orders are in the book, how the fleet is
- * distributed, and the rate / travel matrices planners reason over.
+ * The Data & Rules tab deliberately avoids anything the Director could flip
+ * round to round (pending plan, last round, runtime log live in the Control
+ * Room). It is the "lookup table" tab: what orders are in the book, how the
+ * fleet is distributed, the rate / travel matrices planners reason over, and
+ * the hard constraints `validatePlan` enforces before the Director will
+ * commit a plan.
  */
 export function DispatchDataView({ dispatch }: DispatchDataViewProps) {
   const orders = useMemo(
@@ -106,10 +114,10 @@ export function DispatchDataView({ dispatch }: DispatchDataViewProps) {
       </section>
 
       <section className="control-room-section">
-        <h3>Rate card (€/pallet)</h3>
+        <h3>Rate card (€/truck leg)</h3>
         <div className="control-room-matrix">
           <RouteMatrix
-            cells={(a, b) => (a === b ? "—" : `€${ratePerPallet(a, b)}`)}
+            cells={(a, b) => (a === b ? "—" : `€${ratePerTruckLeg(a, b)}`)}
           />
         </div>
       </section>
@@ -122,8 +130,66 @@ export function DispatchDataView({ dispatch }: DispatchDataViewProps) {
           />
         </div>
       </section>
+
+      <section className="control-room-section">
+        <h3>Business rules</h3>
+        <p className="data-rules-caption">
+          A plan is only committed if <em>every</em> trip satisfies these
+          constraints. Planners that return an infeasible plan are rejected
+          and the Director keeps the current plan.
+        </p>
+        <ul className="data-rules-list">
+          <li>
+            <strong>Truck capacity.</strong> At no point on a trip may an
+            onboard load exceed <code>{TRUCK_CAPACITY}</code> pallets — loads
+            are checked after every stop's pickups and drop-offs.
+          </li>
+          <li>
+            <strong>One trip per truck per day.</strong> Each truck can appear
+            in at most one trip per planning day. Trucks start where they're
+            parked; a trip's first stop must equal the truck's starting city.
+          </li>
+          <li>
+            <strong>Driving window.</strong> Every trip must start no earlier
+            than <code>{formatHour(EARLIEST_START_MINUTES)}</code> and finish
+            no later than <code>{formatHour(LATEST_END_MINUTES)}</code>, where
+            total time is driving hours + {SERVICE_HOURS_PER_STOP}h service
+            per stop.
+          </li>
+          <li>
+            <strong>Driving-hour cap.</strong> A trip's total driving time may
+            not exceed <code>{MAX_DRIVING_HOURS}h</code> (drivers' hours rule).
+          </li>
+          <li>
+            <strong>Pallet routing.</strong> Each pallet must be picked up in
+            its origin city and dropped off in its destination city, on the
+            same trip, with drop-off occurring after pickup along the route.
+          </li>
+          <li>
+            <strong>Full coverage.</strong> Every pallet in the order book
+            must be carried by exactly one trip — a plan may not leave pallets
+            unassigned, and no pallet may ride on two trips.
+          </li>
+          <li>
+            <strong>Pallet manifest consistency.</strong> If a trip declares a
+            top-level <code>palletIds</code>, it must exactly match the pallets
+            actually picked up across that trip's stops.
+          </li>
+          <li>
+            <strong>Real-world cost.</strong> A plan carrying any pallets must
+            have strictly positive cost — zero cost means no truck actually
+            drove, which is rejected as physically impossible.
+          </li>
+        </ul>
+      </section>
     </div>
   );
+}
+
+function formatHour(minutes: number): string {
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
 }
 
 function RouteMatrix({

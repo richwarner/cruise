@@ -1,3 +1,4 @@
+import { CITY_IDS } from "./types";
 import type {
   CityId,
   DispatchState,
@@ -52,20 +53,18 @@ export function travelHours(from: CityId, to: CityId): number {
 }
 
 /**
- * Rate card: €/pallet depends only on the route.
- * Formula: round(hours * 6 + 4).
+ * Rate card: €/truck-leg depends only on the route.
+ *
+ * The business model is "whole truck or nothing" — a truck driving a leg
+ * charges the same whether it's carrying 1 pallet or 30, so planners
+ * should consolidate aggressively to drive €/pallet down. The formula is
+ * a rough model of Portuguese refrigerated trucking: a fixed per-leg
+ * dispatch overhead plus a driving-hours rate that approximates truck +
+ * driver + fuel + refrigeration (~€120/h all-in).
  */
-export function ratePerPallet(from: CityId, to: CityId): number {
+export function ratePerTruckLeg(from: CityId, to: CityId): number {
   if (from === to) return 0;
-  return Math.round(travelHours(from, to) * 6 + 4);
-}
-
-export function legCost(
-  from: CityId,
-  to: CityId,
-  palletCount: number,
-): number {
-  return ratePerPallet(from, to) * palletCount;
+  return Math.round(50 + 120 * travelHours(from, to));
 }
 
 // =============================================================================
@@ -147,13 +146,26 @@ export function tripCarriedPalletIds(trip: Trip): string[] {
   return ids;
 }
 
-export function computeTripCost(trip: Trip, pallets: Pallet[]): number {
-  const byId = new Map(pallets.map((p) => [p.id, p]));
+/**
+ * Per-trip cost = sum of per-truck-leg rates across the trip's driving legs.
+ * Pallet count has no effect on cost (full-truck-or-nothing model), so the
+ * `pallets` argument is unused; it's retained so all cost functions share a
+ * consistent `(trip, pallets)` signature and callers don't need to fan out.
+ *
+ * Walks the stops inline to emit a leg whenever consecutive stops sit in
+ * different cities — mirrors the driving-leg logic in `simulateTrip` without
+ * needing a fleet lookup (this helper is called from the UI and from tests
+ * where the fleet isn't always in scope).
+ */
+export function computeTripCost(trip: Trip, _pallets: Pallet[]): number {
+  void _pallets;
   let total = 0;
-  for (const pid of tripCarriedPalletIds(trip)) {
-    const p = byId.get(pid);
-    if (!p) continue;
-    total += ratePerPallet(p.pickup, p.dropoff);
+  let previousCity: CityId | null = null;
+  for (const stop of trip.stops) {
+    if (previousCity !== null && previousCity !== stop.city) {
+      total += ratePerTruckLeg(previousCity, stop.city);
+    }
+    previousCity = stop.city;
   }
   return total;
 }
@@ -330,15 +342,17 @@ export function validatePlan(
   const totalCost = computePlanCost(plan, pallets);
 
   // Sanity floor: a plan that moves real pallets cannot cost €0 under the
-  // rate card. If this fires it means either (a) every pallet picked up has
-  // pickup === dropoff (a degenerate order) or (b) cost computation drifted
-  // from the simulator's carried-pallet set. Either way, refuse to commit.
+  // per-truck-leg rate card. Every carried pallet needs its trip to include
+  // at least one driving leg (pickup city -> dropoff city), so zero cost
+  // means either (a) a pallet with pickup === dropoff snuck past the schema
+  // refinement, or (b) a trip with all stops in the same city somehow got
+  // validated. Either way, refuse to commit.
   const carriedPalletCount = pallets.length - plan.unassignedPalletIds.length;
   if (totalCost === 0 && carriedPalletCount > 0) {
     return {
       ok: false,
       errors: [
-        `Plan claims to move ${carriedPalletCount} pallet(s) at €0 — that's impossible under the rate card. Check pallet pickup/dropoff cities (likely pickup === dropoff) or the trip's stop.pickupPalletIds.`,
+        `Plan claims to move ${carriedPalletCount} pallet(s) at €0 — under the per-truck-leg rate card every carried pallet's trip must include at least one driving leg. Check that stop pickup cities differ from stop dropoff cities.`,
       ],
     };
   }
@@ -800,6 +814,16 @@ export function buildPlannerPrompt(
     )
     .join("\n");
 
+  const rateMatrixLines = (CITY_IDS as readonly CityId[])
+    .map(
+      (from) =>
+        `  ${from}: ${(CITY_IDS as readonly CityId[])
+          .filter((to) => to !== from)
+          .map((to) => `${to}=€${ratePerTruckLeg(from, to)}`)
+          .join(", ")}`,
+    )
+    .join("\n");
+
   const newOrderBlock = newOrder
     ? `New order to absorb: ${newOrder.summary} (orderId=${newOrder.orderId}, ${newOrder.pallets.length} pallet(s))`
     : "No new order to absorb — re-plan or re-submit the current plan.";
@@ -826,7 +850,7 @@ Hard rules (your plan is rejected if any of these fail):
 - Each trip has a numeric startMinutes in your plan (minutes after midnight), >= 360 (06:00).
 - Every dropoff must complete by 18:00 (endMinutes <= 1080).
 
-Objective: minimize the total cost as computed by the rate card (sum over pallets of the rate for their pickup->dropoff route).
+Objective: minimize total cost. Cost is charged per truck leg at a fixed rate (see the rate card below) — a full truck and an empty truck cost the same for the same leg. Consolidate aggressively: fewer trucks and fewer driving legs win. Combine pallets headed the same direction onto one truck whenever capacity allows, and chain multi-stop trips so one truck covers several orders.
 
 Current fleet:
 ${fleetLines}
@@ -839,6 +863,9 @@ ${currentLines || "  (no trips yet)"}
 
 Travel-time matrix (hours):
 ${matrixLines}
+
+Rate card (€/truck leg, independent of pallet count):
+${rateMatrixLines}
 
 ${newOrderBlock}
 

@@ -37,6 +37,14 @@ import {
 const MAX_PLANNER_TURN_STEPS = 8;
 const MAX_RUNTIME_EVENTS = 30;
 
+/**
+ * Cap on how many characters of the model's final assistant message we
+ * ship back to the Director (and on to the UI) when the planner bails
+ * without calling submitPlan. Models occasionally paste the whole plan
+ * inline — enough headroom to see the shape without ballooning DO state.
+ */
+const MAX_ASSISTANT_TAIL_CHARS = 600;
+
 type ProposePlanArgs = {
   seed: number;
   snapshot: DispatchState;
@@ -124,9 +132,9 @@ export class TripPlannerAgent extends Think<Env, PlannerState> {
         `[planner:${this.name}] saveMessages returned status=${result.status} requestId=${result.requestId}`,
       );
 
-      const after = this.ensurePlannerState();
-      const messageCount = this.getMessages().length;
-      const lastMessage = this.getMessages().at(-1);
+      let after = this.ensurePlannerState();
+      let messageCount = this.getMessages().length;
+      let lastMessage = this.getMessages().at(-1);
       console.log(
         `[planner:${this.name}] post-turn lastCandidate=${
           after.lastCandidate ? after.lastCandidate.valid : "none"
@@ -136,15 +144,55 @@ export class TripPlannerAgent extends Think<Env, PlannerState> {
         return after.lastCandidate;
       }
 
-      // Dump the last assistant message so we can see what the model actually produced
-      // when it refused to call submitPlan.
-      if (lastMessage?.role === "assistant") {
-        const text = lastMessage.parts
-          .filter((p) => p.type === "text")
-          .map((p) => ("text" in p ? p.text : ""))
-          .join("");
+      let assistantTail = extractAssistantText(lastMessage);
+      if (assistantTail) {
         console.log(
-          `[planner:${this.name}] assistant text (no tool call) firstChars=${text.slice(0, 200)}`,
+          `[planner:${this.name}] assistant text (no tool call, attempt 1) firstChars=${assistantTail.slice(0, 200)}`,
+        );
+      }
+
+      // Auto-retry once with a directive reminder. The most common
+      // no_plan failure (especially with low reasoning_effort) is the
+      // model ending its turn with prose instead of calling submitPlan.
+      // A short, blunt reminder nudges it into the tool-use path
+      // without changing the domain prompt. Bounded to exactly one
+      // retry so we can't loop.
+      this.recordRuntimeEvent(
+        "planner no-tool retry",
+        assistantTail
+          ? `Model finished without submitPlan. Tail: ${truncate(assistantTail, 120)}`
+          : "Model finished without submitPlan.",
+      );
+      const reminder = buildNoToolReminder(assistantTail);
+      const retryResult = await this.saveMessages([
+        {
+          id: `${INTERNAL_TURN_MESSAGE_ID_PREFIX}${crypto.randomUUID()}`,
+          role: "user",
+          parts: [{ type: "text", text: reminder }],
+        },
+      ]);
+      console.log(
+        `[planner:${this.name}] retry saveMessages returned status=${retryResult.status} requestId=${retryResult.requestId}`,
+      );
+
+      after = this.ensurePlannerState();
+      messageCount = this.getMessages().length;
+      lastMessage = this.getMessages().at(-1);
+      console.log(
+        `[planner:${this.name}] post-retry lastCandidate=${
+          after.lastCandidate ? after.lastCandidate.valid : "none"
+        } messages=${messageCount} lastRole=${lastMessage?.role}`,
+      );
+      if (after.lastCandidate) {
+        return after.lastCandidate;
+      }
+
+      // Retry also bailed — capture whatever the model said and give up.
+      const retryTail = extractAssistantText(lastMessage);
+      if (retryTail) {
+        assistantTail = retryTail;
+        console.log(
+          `[planner:${this.name}] assistant text (no tool call, attempt 2) firstChars=${retryTail.slice(0, 200)}`,
         );
       }
 
@@ -153,9 +201,12 @@ export class TripPlannerAgent extends Think<Env, PlannerState> {
         seed: args.seed,
         plan: { trips: [], unassignedPalletIds: args.snapshot.pallets.map((p) => p.id) },
         valid: false,
-        errors: ["Planner did not submit a plan."],
+        errors: ["Planner did not submit a plan (retried once)."],
         errorKind: "no_plan",
         submittedAt: Date.now(),
+        assistantTail: assistantTail
+          ? truncate(assistantTail, MAX_ASSISTANT_TAIL_CHARS)
+          : undefined,
       };
       this.setState({ ...after, lastCandidate: fallback });
       return fallback;
@@ -328,4 +379,44 @@ Never claim a plan was accepted unless submitPlan returns ok:true.`;
 function seedFromName(name: string): number {
   const match = name.match(/-(\d+)$/);
   return match ? Number(match[1]) : 1;
+}
+
+/**
+ * Prompt we inject if the model ends its first turn without calling
+ * `submitPlan`. Short and directive — the model has already seen the full
+ * planner prompt, so repeating it doesn't help; what helps is an
+ * unambiguous instruction to stop producing prose and invoke the tool.
+ *
+ * If we captured the model's own prose, we quote a snippet back at it so
+ * it's obvious *what* it just did wrong, which consistently outperforms a
+ * content-free reminder in small-model evals.
+ */
+function buildNoToolReminder(previousText: string | undefined): string {
+  const base = [
+    "Your previous response did not call `submitPlan`. That is a hard requirement.",
+    "Do not produce prose, analysis, or JSON in chat. Call the `submitPlan` tool exactly once, with a complete plan that assigns every pallet in the order book to exactly one trip.",
+    "If you need to re-read the snapshot, call `inspectSnapshot` first. Then call `submitPlan`. Do not reply with text.",
+  ];
+  if (previousText && previousText.trim().length > 0) {
+    const snippet = truncate(previousText.trim(), 200);
+    base.unshift(
+      `You just replied with: "${snippet}"${previousText.length > 200 ? "…" : ""}`,
+    );
+  }
+  return base.join("\n\n");
+}
+
+function extractAssistantText(
+  message: ReturnType<TripPlannerAgent["getMessages"]>[number] | undefined,
+): string | undefined {
+  if (!message || message.role !== "assistant") return undefined;
+  const text = message.parts
+    .filter((p) => p.type === "text")
+    .map((p) => ("text" in p ? p.text : ""))
+    .join("");
+  return text.trim().length > 0 ? text : undefined;
+}
+
+function truncate(s: string, max: number): string {
+  return s.length <= max ? s : `${s.slice(0, max)}…`;
 }

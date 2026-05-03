@@ -75,8 +75,7 @@ export function CruiseRoute() {
           <p>
             Describe a new order in the Director chat or click Submit test order
             to fan three Planner sub-agents out in parallel; the cheapest valid
-            plan replaces tomorrow's schedule. Shrink the fleet to force
-            infeasible rounds.
+            plan replaces tomorrow's schedule.
           </p>
         </div>
         <div className="app-header-actions">
@@ -117,9 +116,7 @@ export function CruiseRoute() {
               onClick={() =>
                 setPanelView((v) => {
                   const i = PANEL_VIEW_ORDER.indexOf(v);
-                  return PANEL_VIEW_ORDER[
-                    (i + 1) % PANEL_VIEW_ORDER.length
-                  ];
+                  return PANEL_VIEW_ORDER[(i + 1) % PANEL_VIEW_ORDER.length];
                 })
               }
             >
@@ -147,14 +144,14 @@ export function CruiseRoute() {
           <div className="side-panel-tabs">
             <SideTabs view={sideView} onChange={setSideView} />
           </div>
-            {sideView === "chat" ? (
-              <DirectorChatPanel
-                agent={director}
-                dispatch={dispatch}
-                directorActions={dispatch?.recentDirectorActions ?? []}
-                onResponseComplete={refresh}
-              />
-            ) : (
+          {sideView === "chat" ? (
+            <DirectorChatPanel
+              agent={director}
+              dispatch={dispatch}
+              directorActions={dispatch?.recentDirectorActions ?? []}
+              onResponseComplete={refresh}
+            />
+          ) : (
             <PlannerActivityPanel
               dispatch={dispatch}
               plannerStates={plannerStates}
@@ -173,7 +170,8 @@ function buildRoundStatus(
   pendingOrderId: string | undefined,
   roundAllInvalid: boolean,
 ): string | null {
-  if (isSubmittingOrder) return `Planners running${pendingOrderId ? ` for ${pendingOrderId}` : ""}…`;
+  if (isSubmittingOrder)
+    return `Planners running${pendingOrderId ? ` for ${pendingOrderId}` : ""}…`;
   if (directorThinking) return "Director thinking…";
   if (pendingOrderId && roundAllInvalid) {
     return `Round failed: ${pendingOrderId}`;
@@ -192,7 +190,7 @@ function PanelTabs({
   const tabs: Array<{ id: PanelView; label: string }> = [
     { id: "operations", label: "Operations" },
     { id: "control-room", label: "Control Room" },
-    { id: "data", label: "Data" },
+    { id: "data", label: "Data & Rules" },
   ];
   return (
     <div className="panel-tabs" role="tablist">
@@ -227,7 +225,9 @@ function SideTabs({
         type="button"
         role="tab"
         aria-selected={view === "chat"}
-        className={view === "chat" ? "panel-tab panel-tab--active" : "panel-tab"}
+        className={
+          view === "chat" ? "panel-tab panel-tab--active" : "panel-tab"
+        }
         onClick={() => onChange("chat")}
       >
         Director Chat

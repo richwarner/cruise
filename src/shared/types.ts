@@ -64,6 +64,13 @@ export type PlannerCandidate = {
   errors?: string[];
   errorKind?: PlannerErrorKind;
   submittedAt: number;
+  /**
+   * Last assistant message text captured when the planner bailed without
+   * calling `submitPlan` (i.e. `errorKind === "no_plan"`). Truncated on the
+   * server side. Lets the operator see *why* the model refused to submit
+   * (e.g. "I'd need more trucks in OPO…") instead of just a generic error.
+   */
+  assistantTail?: string;
 };
 
 export type OrderEvent = {

@@ -2,7 +2,7 @@ import { createWorkersAI } from "workers-ai-provider";
 
 import type { ReasoningEffort } from "../shared/personas";
 
-export const CRUISE_MODEL_ID = "@cf/moonshotai/kimi-k2.5";
+export const CRUISE_MODEL_ID = "@cf/moonshotai/kimi-k2.6";
 export const CRUISE_PROBE_MODEL_ID = "@cf/meta/llama-3.1-8b-instruct";
 
 /**

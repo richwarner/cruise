@@ -53,7 +53,7 @@ const PLANNER_TIMEOUT_LABEL = `${Math.round(PLANNER_TIMEOUT_MS / 1000)}s`;
  * caps how long a user waits when one planner is pathologically slow while
  * still preserving the "cheapest valid" objective when all three are healthy.
  */
-const FIRST_VALID_GRACE_MS = 15_000;
+const FIRST_VALID_GRACE_MS = 300_000;
 
 type AddOrderInput = z.infer<typeof addOrderInputSchema>;
 type SubmitOrderInput = z.infer<typeof submitOrderInputSchema>;

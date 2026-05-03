@@ -1,8 +1,5 @@
 import type { DispatchState } from "../../shared/types";
-import {
-  computePlanCost,
-  pickCheapestFeasible,
-} from "../../shared/cruise";
+import { computePlanCost, pickCheapestFeasible } from "../../shared/cruise";
 import { PlannerCandidateCard } from "./PlannerCandidateCard";
 import { SessionTrendsPanel } from "./SessionTrendsPanel";
 
@@ -42,9 +39,7 @@ export function DispatchControlRoom({ dispatch }: DispatchControlRoomProps) {
       <section className="control-room-section">
         <h3>Last planner round</h3>
         {dispatch.lastRound.length === 0 ? (
-          <div className="control-room-empty">
-            Awaiting first order — no planner round has run yet.
-          </div>
+          <div className="control-room-empty">Awaiting planner results...</div>
         ) : (
           <div className="control-room-candidates">
             {dispatch.lastRound.map((c) => (

@@ -1134,6 +1134,47 @@ code {
   font-size: 12px;
 }
 
+.data-rules-caption {
+  margin: 0 0 10px;
+  color: var(--cruise-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.data-rules-caption em {
+  font-style: normal;
+  color: var(--cruise-fg, inherit);
+}
+
+.data-rules-list {
+  margin: 0;
+  padding: 0 0 0 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.data-rules-list li {
+  color: var(--cruise-muted);
+}
+
+.data-rules-list li strong {
+  color: var(--cruise-fg, inherit);
+  font-weight: 600;
+  margin-right: 4px;
+}
+
+.data-rules-list code {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--cruise-fg, inherit);
+  font-family: var(--cruise-font-mono, ui-monospace, monospace);
+  font-size: 11px;
+}
+
 .data-order-pending {
   margin-left: 6px;
   padding: 1px 6px;
@@ -1464,6 +1505,257 @@ code {
   letter-spacing: 0.08em;
   padding: 2px 6px;
   border-radius: 4px;
+}
+
+/* --- Phase 9.5: richer planner activity card --- */
+
+.planner-card-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 10px;
+  color: var(--cruise-muted);
+  margin-top: -2px;
+}
+
+.planner-card-effort {
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--cruise-line);
+  background: rgba(255, 255, 255, 0.03);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+}
+
+.planner-card-errorkind {
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-weight: 600;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.planner-card-errorkind[data-kind="infeasible"] {
+  background: color-mix(in srgb, var(--cruise-danger) 14%, transparent);
+  color: var(--cruise-danger);
+  border: 1px solid var(--cruise-danger);
+}
+
+.planner-card-errorkind[data-kind="no_plan"] {
+  background: color-mix(in srgb, var(--cruise-muted) 14%, transparent);
+  color: var(--cruise-muted);
+  border: 1px solid var(--cruise-line);
+}
+
+.planner-card-errorkind[data-kind="timeout"] {
+  background: color-mix(in srgb, var(--cruise-warning) 14%, transparent);
+  color: var(--cruise-warning, #f59e0b);
+  border: 1px solid var(--cruise-warning, #f59e0b);
+}
+
+.planner-card-errorkind[data-kind="ai_unreachable"] {
+  background: color-mix(in srgb, var(--cruise-warning) 14%, transparent);
+  color: var(--cruise-warning, #f59e0b);
+  border: 1px dashed var(--cruise-warning, #f59e0b);
+}
+
+.planner-card-stage {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--cruise-text);
+  padding: 5px 8px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--cruise-line);
+}
+
+.planner-card-stage-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+  background: var(--cruise-muted);
+}
+
+.planner-card-stage[data-kind="reasoning"] .planner-card-stage-dot,
+.planner-card-stage[data-kind="reading"] .planner-card-stage-dot,
+.planner-card-stage[data-kind="validating"] .planner-card-stage-dot {
+  background: var(--cruise-accent);
+  animation: cruise-thinking-pulse 1.4s ease-in-out infinite;
+}
+
+.planner-card-stage[data-kind="retrying"] .planner-card-stage-dot {
+  background: var(--cruise-warning, #f59e0b);
+  animation: cruise-thinking-pulse 1.4s ease-in-out infinite;
+}
+
+.planner-card-stage[data-kind="accepted"] .planner-card-stage-dot {
+  background: var(--cruise-ok);
+}
+
+.planner-card-stage[data-kind="rejected"] .planner-card-stage-dot,
+.planner-card-stage[data-kind="infeasible"] .planner-card-stage-dot,
+.planner-card-stage[data-kind="error"] .planner-card-stage-dot,
+.planner-card-stage[data-kind="timeout"] .planner-card-stage-dot {
+  background: var(--cruise-danger);
+}
+
+.planner-card-stage-label {
+  flex: 1 1 auto;
+  font-weight: 600;
+}
+
+.planner-card-stage-timer,
+.planner-card-stage-attempts {
+  flex: 0 0 auto;
+  font-size: 10px;
+  color: var(--cruise-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.planner-card-stage-timer {
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.planner-card-plan {
+  font-size: 11px;
+  color: var(--cruise-muted);
+}
+
+.planner-card-plan summary {
+  cursor: pointer;
+  color: var(--cruise-text);
+  font-weight: 500;
+}
+
+.planner-card-plan ul {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-height: 140px;
+  overflow-y: auto;
+}
+
+.planner-card-plan li {
+  display: grid;
+  grid-template-columns: 36px 1fr auto;
+  gap: 6px;
+  align-items: baseline;
+}
+
+.planner-card-plan-truck {
+  font-family: var(--cruise-font-mono, ui-monospace, monospace);
+  font-size: 10px;
+  color: var(--cruise-muted);
+  font-weight: 600;
+}
+
+.planner-card-plan-route {
+  color: var(--cruise-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.planner-card-plan-pallets {
+  color: var(--cruise-muted);
+  font-variant-numeric: tabular-nums;
+  font-size: 10px;
+}
+
+.planner-card-fulllog {
+  font-size: 11px;
+  color: var(--cruise-muted);
+}
+
+.planner-card-fulllog summary {
+  cursor: pointer;
+  color: var(--cruise-text);
+  font-weight: 500;
+}
+
+.planner-card-fulllog ol {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.planner-card-fulllog li {
+  display: grid;
+  grid-template-columns: 68px 1fr;
+  gap: 6px;
+  align-items: baseline;
+}
+
+.planner-card-fulllog time {
+  color: var(--cruise-muted);
+  font-variant-numeric: tabular-nums;
+  font-size: 10px;
+}
+
+.planner-card-fulllog span {
+  color: var(--cruise-text);
+}
+
+.planner-card-fulllog em {
+  grid-column: 2;
+  font-style: normal;
+  color: var(--cruise-muted);
+  font-size: 10px;
+  word-break: break-word;
+}
+
+.planner-card-assistant-tail {
+  font-size: 11px;
+  color: var(--cruise-muted);
+}
+
+.planner-card-assistant-tail summary {
+  cursor: pointer;
+  color: var(--cruise-warning, #f59e0b);
+  font-weight: 600;
+}
+
+.planner-card-assistant-tail blockquote {
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  border-left: 2px solid var(--cruise-warning, #f59e0b);
+  background: rgba(245, 158, 11, 0.06);
+  color: var(--cruise-text);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.planner-card-assistant-tail-note {
+  margin: 6px 0 0;
+  font-size: 10px;
+  color: var(--cruise-muted);
+  line-height: 1.5;
+}
+
+.planner-card-assistant-tail-note code {
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.06);
+  font-family: var(--cruise-font-mono, ui-monospace, monospace);
+  font-size: 10px;
 }
 
 /* --- Phase 4: round status + test order button --- */
